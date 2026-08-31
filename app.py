@@ -55,4 +55,3 @@ if api_key:
         st.error(f"エラーが発生しました: {e}")
 else:
     st.info("左上のメニュー（>>）からサイドバーを開き、Gemini API キーを入力してください。")
-　
