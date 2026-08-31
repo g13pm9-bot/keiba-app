@@ -16,7 +16,8 @@ if api_key:
     uploaded_file = st.file_uploader("馬柱の画像を選択してください（スクショや写真）", type=["jpg", "jpeg", "png"])
 
     if uploaded_file is not None:
-        st.image(uploaded_file, caption="アップロードされた馬柱", use_column_width=True)
+        # 画像を表示（エラーが出ない安全な書き方に修正）
+        st.image(uploaded_file, caption="アップロードされた馬柱")
         
         if st.button("この馬柱を解析してスコア化する"):
             with st.spinner("AIが馬柱を解析中..."):
