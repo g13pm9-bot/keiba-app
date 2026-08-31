@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 from google import genai
 from google.genai import types
@@ -5,11 +6,8 @@ from google.genai import types
 st.title("馬柱 ＆ 予想支援アプリ")
 st.write("競馬新聞や出馬表の画像をアップロードすると、AIが情報を読み取り、独自のロジックでスコア化します。")
 
-# StreamlitのSecretsからAPIキーを自動取得
-try:
-    api_key = st.secrets["GEMINI_API_KEY"]
-except Exception:
-    api_key = st.sidebar.text_input("Gemini APIキーを入力してください", type="password")
+# サイドバーまたは環境変数からAPIキーを取得
+api_key = st.sidebar.text_input("Gemini APIキーを入力してください", type="password")
 
 if api_key:
     try:
@@ -18,7 +16,8 @@ if api_key:
         uploaded_file = st.file_uploader("馬柱の画像を選択してください（スクショや写真）", type=["jpg", "jpeg", "png"])
 
         if uploaded_file is not None:
-            st.image(uploaded_file, caption="アップロードされた馬柱")
+            # 最新のStreamlit仕様に合わせて use_container_width に修正
+            st.image(uploaded_file, caption="アップロードされた馬柱", use_container_width=True)
             
             if st.button("この馬柱を解析してスコア化する"):
                 with st.spinner("AIが馬柱を解析中..."):
@@ -55,4 +54,4 @@ if api_key:
     except Exception as e:
         st.error(f"エラーが発生しました: {e}")
 else:
-    st.warning("APIキーが設定されていません。StreamlitのSecretsを設定するか、サイドバーに入力してください。")
+    st.info("左上のメニュー（>>）からサイドバーを開き、Gemini API キーを入力してください。")
