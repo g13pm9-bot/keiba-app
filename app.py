@@ -1,5 +1,3 @@
-st.title("馬柱 ＆ 予想支援アプリ")
-# （以降のコードが続く）
 # -*- coding: utf-8 -*-
 import os
 import streamlit as st
@@ -25,10 +23,10 @@ if api_key:
             st.image(uploaded_file, caption="アップロードされた馬柱", use_container_width=True)
             
             if st.button("この馬柱を解析してスコア化する"):
-                with st.spinner("プロの競馬アナリストが馬柱を厳密に採点・分析中..."):
+                with st.spinner("Analyzing..."):
                     image_bytes = uploaded_file.getvalue()
                     
-                    # あなたが考えてくださった最強のプロンプトをここに配置！
+                    # プロの競馬アナリストの最強プロンプト
                     prompt = """
 # 役割 (Persona)
 あなたはプロの競馬アナリストであり、感情を排してデータと客観的事実に基づき出走馬を数値化・評価するAIです。提供された競馬新聞の出走表（馬柱）およびオッズ情報をもとに、厳格な配点基準に従って全頭を採点し、期待値の高い馬を炙り出します。
@@ -87,7 +85,8 @@ if api_key:
 - ○ 対抗: 
 - ▲ 単穴: 
 - ☆ 穴馬: 
-- △ 抑え / ◇ 超穴: 
+- △ 抑え: 
+- ◇ 超穴: 
 
 # 制約事項 (Guardrails)
 * ハルシネーションの厳禁: 画像に記載されていないデータや事実に基づかない情報の捏造を厳格に禁止します。
