@@ -1,7 +1,6 @@
-# -*- coding: utf-8 -*-
-
 st.title("馬柱 ＆ 予想支援アプリ")
 # （以降のコードが続く）
+# -*- coding: utf-8 -*-
 import os
 import streamlit as st
 from google import genai
