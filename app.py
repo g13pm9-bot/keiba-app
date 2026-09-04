@@ -23,7 +23,6 @@ if api_key:
             st.image(uploaded_file, caption="アップロードされた馬柱", use_container_width=True)
             
             if st.button("この馬柱を解析してスコア化する"):
-                # ▼ ここを英語に変更して文字コードエラーを回避 ▼
                 with st.spinner("Analyzing..."):
                     image_bytes = uploaded_file.getvalue()
                     
