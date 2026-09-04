@@ -92,7 +92,7 @@ if api_key:
 
                     # ▼ 幻覚モデル(3.6)ではなく、実在する正しいモデル(1.5)に修正 ▼
                     response = client.models.generate_content(
-                        model='gemini-1.5-flash',
+                        model='gemini-3.6-flash',
                         contents=[
                             types.Part.from_bytes(
                                 data=image_bytes,
