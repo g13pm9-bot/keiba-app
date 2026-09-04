@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-import os
 import streamlit as st
 from google import genai
 from google.genai import types
@@ -16,14 +14,13 @@ except Exception:
 if api_key:
     try:
         client = genai.Client(api_key=api_key)
-
         uploaded_file = st.file_uploader("馬柱の画像を選択してください（スクショや写真）", type=["jpg", "jpeg", "png"])
 
         if uploaded_file is not None:
             st.image(uploaded_file, caption="アップロードされた馬柱", use_container_width=True)
             
             if st.button("この馬柱を解析してスコア化する"):
-                with st.spinner("Analyzing..."):
+                with st.spinner("プロの競馬アナリストが馬柱を厳密に採点・分析中..."):
                     image_bytes = uploaded_file.getvalue()
                     
                     prompt = """
@@ -93,8 +90,9 @@ if api_key:
 * 根拠の明示: スコアの算出にあたっては、画像内のどの情報を根拠にしたのかを必ず示してください。
                     """
 
+                    # ▼ 幻覚モデル(3.6)ではなく、実在する正しいモデル(1.5)に修正 ▼
                     response = client.models.generate_content(
-                        model='gemini-3.6-flash',
+                        model='gemini-1.5-flash',
                         contents=[
                             types.Part.from_bytes(
                                 data=image_bytes,
