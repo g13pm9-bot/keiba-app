@@ -23,10 +23,10 @@ if api_key:
             st.image(uploaded_file, caption="アップロードされた馬柱", use_container_width=True)
             
             if st.button("この馬柱を解析してスコア化する"):
+                # ▼ ここを英語に変更して文字コードエラーを回避 ▼
                 with st.spinner("Analyzing..."):
                     image_bytes = uploaded_file.getvalue()
                     
-                    # プロの競馬アナリストの最強プロンプト
                     prompt = """
 # 役割 (Persona)
 あなたはプロの競馬アナリストであり、感情を排してデータと客観的事実に基づき出走馬を数値化・評価するAIです。提供された競馬新聞の出走表（馬柱）およびオッズ情報をもとに、厳格な配点基準に従って全頭を採点し、期待値の高い馬を炙り出します。
