@@ -24,6 +24,7 @@ from datetime import datetime
 from typing import Any
 
 import streamlit as st
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from google import genai
 from google.genai import types
 
@@ -160,7 +161,12 @@ PROMPT = r"""
 
 重要:
 - 読めない数字は null。
-- 複数画像は相互参照し、同じ馬を統合。
+- 複数画像はすべて同じレースの資料として相互参照し、同じ馬を統合。
+- 各画像の直前に「画像種別」の説明が付く。その用途を優先して読む。
+- 全体画像より拡大画像で文字・数字が鮮明な場合は、拡大画像を優先する。
+- 同じ項目が複数画像にある場合、最も鮮明で判読可能な値を採用する。
+- 同一馬の照合は馬番を最優先し、馬名・騎手名を補助にする。
+- 異なる画像で値が食い違い、どちらが正しいか判断できない場合は推測せず null。
 - 馬の評価、順位、印、能力点は作らない。
 - previous_races は集計せず、読めるレースを1行ずつ保存。
 - 長期休養馬は休養前のレースをできるだけ残す。
@@ -500,61 +506,183 @@ def extract_json(text):
     return json.loads(t)
 
 
+
+# ---------------------------------------------------------
+# v4.2 画像前処理・複数画像統合
+# ---------------------------------------------------------
+def prepare_image_bytes(uploaded_file):
+    """
+    スマホ写真をGeminiへ渡す前に、
+    - EXIF回転補正
+    - 長辺3200pxまで拡大/縮小
+    - 軽いコントラスト・シャープ化
+    を行う。
+    元画像自体は変更しない。
+    """
+    raw = uploaded_file.getvalue()
+    img = Image.open(io.BytesIO(raw))
+    img = ImageOps.exif_transpose(img).convert("RGB")
+
+    max_side = max(img.size)
+    target_max = 3200
+
+    if max_side < 2200:
+        scale = min(2.0, target_max / max_side)
+    elif max_side > target_max:
+        scale = target_max / max_side
+    else:
+        scale = 1.0
+
+    if abs(scale - 1.0) > 0.01:
+        new_size = (
+            max(1, int(img.width * scale)),
+            max(1, int(img.height * scale)),
+        )
+        img = img.resize(new_size, Image.Resampling.LANCZOS)
+
+    img = ImageEnhance.Contrast(img).enhance(1.08)
+    img = ImageEnhance.Sharpness(img).enhance(1.15)
+    img = img.filter(ImageFilter.UnsharpMask(radius=1.2, percent=110, threshold=3))
+
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=95, subsampling=0)
+    return buf.getvalue(), "image/jpeg"
+
+
+def files_signature(grouped_files):
+    h = hashlib.sha256()
+    for group_name, files in grouped_files:
+        h.update(group_name.encode("utf-8"))
+        for f in files:
+            h.update(f.name.encode("utf-8"))
+            h.update(f.getvalue())
+    return h.hexdigest()
+
+
+def add_group_to_contents(contents, label, files):
+    for i, f in enumerate(files, 1):
+        enhanced_bytes, mime = prepare_image_bytes(f)
+        contents.append(
+            f"【画像種別: {label} / {i}枚目】"
+            " このラベルの用途を意識して読み取ってください。"
+        )
+        contents.append(types.Part.from_bytes(data=enhanced_bytes, mime_type=mime))
+
+
 # ---------------------------------------------------------
 # UI
 # ---------------------------------------------------------
-st.set_page_config(page_title="馬柱＆予想支援 v4.1", layout="wide")
-st.title("🏇 馬柱 ＆ 予想支援アプリ v4.1")
-st.caption("v4.1: Gemini 3.6 Flash対応。AIは事実抽出、採点はPythonの固定計算です。")
+st.set_page_config(page_title="馬柱＆予想支援 v4.2", layout="wide")
+st.title("🏇 馬柱 ＆ 予想支援アプリ v4.2")
+st.caption("v4.2: 全体＋拡大画像を用途別に複数登録。画像を高解像度化してからGeminiで事実抽出します。")
 
 try:
     api_key = st.secrets["GEMINI_API_KEY"]
 except Exception:
     api_key = st.sidebar.text_input("Gemini APIキー", type="password")
 
+st.sidebar.subheader("v4.2 撮影のコツ")
+st.sidebar.write("・全体画像: 馬番と並びが分かる程度")
+st.sidebar.write("・近走欄: 文字が潰れない大きさまで拡大")
+st.sidebar.write("・調教欄: 時計が読める大きさで別撮影")
+st.sidebar.write("・少し重複させて撮ると同一馬を照合しやすい")
+st.sidebar.divider()
 st.sidebar.subheader("100点配分")
 for k, v in WEIGHTS.items():
     st.sidebar.write(f"{k}: {v:g}点")
 
-files = st.file_uploader(
-    "競馬新聞・馬柱の画像（全体＋拡大を複数推奨）",
-    type=["jpg", "jpeg", "png", "webp"],
-    accept_multiple_files=True,
+st.subheader("📷 画像登録")
+st.caption(
+    "同じレースの画像を用途別に登録してください。"
+    "全体写真に加えて、文字が読めるように拡大した写真を複数枚入れるのがおすすめです。"
 )
 
+whole_files = st.file_uploader(
+    "① 全体画像（レース全体・馬番確認用）",
+    type=["jpg", "jpeg", "png", "webp"],
+    accept_multiple_files=True,
+    key="whole_files",
+)
+card_files = st.file_uploader(
+    "② 馬柱・近走成績の拡大画像（複数可）",
+    type=["jpg", "jpeg", "png", "webp"],
+    accept_multiple_files=True,
+    key="card_files",
+)
+training_files = st.file_uploader(
+    "③ 調教・追い切り欄の拡大画像（複数可）",
+    type=["jpg", "jpeg", "png", "webp"],
+    accept_multiple_files=True,
+    key="training_files",
+)
+other_files = st.file_uploader(
+    "④ オッズ・血統・騎手情報・その他の拡大画像（複数可）",
+    type=["jpg", "jpeg", "png", "webp"],
+    accept_multiple_files=True,
+    key="other_files",
+)
+
+grouped_files = [
+    ("全体画像", whole_files or []),
+    ("馬柱・近走成績の拡大", card_files or []),
+    ("調教・追い切り欄の拡大", training_files or []),
+    ("オッズ・血統・騎手・その他の拡大", other_files or []),
+]
+files = [f for _, fs in grouped_files for f in fs]
+
 if files:
-    cols = st.columns(min(4, len(files)))
-    for i, f in enumerate(files):
-        with cols[i % len(cols)]:
-            st.image(f, caption=f.name, use_container_width=True)
+    st.write(f"登録画像: **{len(files)}枚**")
+    with st.expander("画像プレビュー", expanded=False):
+        cols = st.columns(3)
+        n = 0
+        for group_name, fs in grouped_files:
+            for f in fs:
+                with cols[n % 3]:
+                    st.image(f, caption=f"{group_name} / {f.name}", use_container_width=True)
+                n += 1
+
+force_reread = st.checkbox(
+    "同じ画像でもGeminiに再読取させる",
+    value=False,
+    help="通常はOFF推奨。OFFなら同一画像セットはセッション内の前回抽出データを再利用します。"
+)
 
 run = st.button(
-    "🔍 解析 → 固定ルール採点",
+    "🔍 複数画像を統合解析 → 固定ルール採点",
     type="primary",
     disabled=not (api_key and files),
 )
 
 if run:
     try:
-        client = genai.Client(api_key=api_key)
-        contents = []
-        for f in files:
-            contents.append(types.Part.from_bytes(data=f.getvalue(), mime_type=f.type))
-        contents.append(PROMPT)
+        signature = files_signature(grouped_files)
+        cache_key = f"extract_{signature}"
 
-        with st.spinner("Geminiが画像から事実データを抽出しています…"):
-            response = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=contents,
-                config={
-                    "temperature": TEMPERATURE,
-                    "seed": 7,
-                    "response_mime_type": "application/json",
-                    "response_json_schema": SCHEMA,
-                },
-            )
+        if (not force_reread) and cache_key in st.session_state:
+            data = st.session_state[cache_key]
+            st.info("同じ画像セットの前回抽出データを再利用しました。Geminiの再読取はしていません。")
+        else:
+            client = genai.Client(api_key=api_key)
+            contents = [PROMPT]
+            add_group_to_contents(contents, "全体画像", whole_files or [])
+            add_group_to_contents(contents, "馬柱・近走成績の拡大画像", card_files or [])
+            add_group_to_contents(contents, "調教・追い切り欄の拡大画像", training_files or [])
+            add_group_to_contents(contents, "オッズ・血統・騎手・その他の拡大画像", other_files or [])
 
-        data = extract_json(response.text)
+            with st.spinner("複数の拡大画像を高解像度化し、Geminiが同一レースとして統合しています…"):
+                response = client.models.generate_content(
+                    model=MODEL_NAME,
+                    contents=contents,
+                    config={
+                        "temperature": TEMPERATURE,
+                        "seed": 7,
+                        "response_mime_type": "application/json",
+                        "response_json_schema": SCHEMA,
+                    },
+                )
+
+            data = extract_json(response.text)
+            st.session_state[cache_key] = data
         race = data.get("race", {})
         horses = data.get("horses", [])
 
@@ -681,4 +809,4 @@ if run:
         st.error(f"エラーが発生しました: {e}")
         st.exception(e)
 else:
-    st.info("馬柱画像をアップロードしてください。")
+    st.info("全体画像＋必要な拡大画像をアップロードしてください。")
