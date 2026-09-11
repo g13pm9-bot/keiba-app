@@ -19,6 +19,7 @@ v4で追加:
 
 import json
 import os
+import hashlib
 import re
 from datetime import datetime
 from typing import Any
