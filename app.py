@@ -1,104 +1,67 @@
 # -*- coding: utf-8 -*-
 """
-馬柱 ＆ 予想支援アプリ - Deterministic Scoring Edition
+馬柱＆予想支援アプリ v4
 
-設計方針:
-1. Geminiには「画像から事実を抽出」させる。採点はさせない。
-2. 採点はPython側の固定ルールで行うため、同じ入力なら同じ結果になる。
-3. 画像にない情報は null / unknown とし、推測しない。
-4. 休み明け・叩き2走目・叩き3走目を専用ロジックで処理する。
-5. Geminiの出力はJSON Schemaで固定する。
-6. オッズは「能力点」と分離し、馬券妙味の評価にだけ使う。
+設計:
+  Gemini: 画像から事実を抽出
+  Python: 全馬を比較して固定ルールで100点を算出
+
+v4で追加:
+  - 調教時計のレース内相対評価
+  - 近走の着差・着順を機械評価
+  - 休養期間と休養明け走数の扱い
+  - 馬体重・増減の状態補正
+  - 脚質の頭数比較
+  - 同条件実績の自動集計
+  - オッズから参考期待値を計算
+  - AIの自由な印付けを廃止
 """
 
 import json
-import math
 import os
 import re
-from dataclasses import dataclass, asdict
-from typing import Any, Dict, List, Optional
+from datetime import datetime
+from typing import Any
 
 import streamlit as st
 from google import genai
 from google.genai import types
 
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+TEMPERATURE = 0.0
 
-# ============================================================
-# 基本設定
-# ============================================================
-
-APP_TITLE = "馬柱 ＆ 予想支援アプリ"
-MODEL_NAME = "gemini-3.6-flash"
-
-# AIによる採点ブレをなくすため、採点そのものはPythonで実施する。
-# Geminiは「画像→構造化データ抽出」だけ担当。
-AI_TEMPERATURE = 0.0
-
-
-# ============================================================
-# データモデル
-# ============================================================
-
-@dataclass
-class Score:
-    ability: float = 0.0       # 20
-    suitability: float = 0.0   # 18
-    training: float = 0.0      # 17
-    pace: float = 0.0          # 15
-    jockey: float = 0.0        # 12
-    pedigree: float = 0.0      # 10
-    gate: float = 0.0          # 8
-
-    @property
-    def total(self) -> float:
-        return round(
-            self.ability
-            + self.suitability
-            + self.training
-            + self.pace
-            + self.jockey
-            + self.pedigree
-            + self.gate,
-            1,
-        )
+WEIGHTS = {
+    "能力・近走": 20.0,
+    "コース・距離・馬場適性": 18.0,
+    "調教・状態": 17.0,
+    "脚質・展開": 15.0,
+    "騎手": 12.0,
+    "血統": 10.0,
+    "枠順": 8.0,
+}
 
 
-@dataclass
-class HorseResult:
-    horse_number: Optional[int]
-    horse_name: str
-    score: Score
-    rank: str
-    mark: str
-    notes: List[str]
-
-
-# ============================================================
-# Gemini JSON Schema
-# ============================================================
-
-RACE_SCHEMA = {
+# ---------------------------------------------------------
+# Gemini: OCR / 構造化のみ
+# ---------------------------------------------------------
+SCHEMA = {
     "type": "object",
     "properties": {
         "race": {
             "type": "object",
             "properties": {
-                "racecourse": {"type": "string"},
-                "race_number": {"type": "integer"},
-                "race_name": {"type": "string"},
-                "surface": {"type": "string"},
-                "distance_m": {"type": "integer"},
-                "track_condition": {"type": "string"},
-                "race_date": {"type": "string"},
+                "date": {"type": ["string", "null"]},
+                "course": {"type": ["string", "null"]},
+                "race_number": {"type": ["integer", "null"]},
+                "surface": {"type": ["string", "null"]},
+                "distance_m": {"type": ["integer", "null"]},
+                "track_condition": {"type": ["string", "null"]},
+                "class_name": {"type": ["string", "null"]},
+                "field_size": {"type": ["integer", "null"]},
             },
             "required": [
-                "racecourse",
-                "race_number",
-                "race_name",
-                "surface",
-                "distance_m",
-                "track_condition",
-                "race_date",
+                "date", "course", "race_number", "surface",
+                "distance_m", "track_condition", "class_name", "field_size"
             ],
         },
         "horses": {
@@ -106,23 +69,37 @@ RACE_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "horse_number": {"type": "integer"},
-                    "frame_number": {"type": "integer"},
-                    "horse_name": {"type": "string"},
-                    "jockey": {"type": "string"},
-                    "trainer": {"type": "string"},
-
+                    "horse_number": {"type": ["integer", "null"]},
+                    "frame_number": {"type": ["integer", "null"]},
+                    "horse_name": {"type": ["string", "null"]},
+                    "jockey_name": {"type": ["string", "null"]},
                     "running_style": {
-                        "type": "string",
-                        "enum": ["逃げ", "先行", "好位", "差し", "追込", "不明"],
+                        "type": ["string", "null"],
+                        "enum": ["逃げ", "先行", "差し", "追込", "不明", None],
                     },
+                    "days_since_last_race": {"type": ["integer", "null"]},
 
-                    "days_since_last_race": {
-                        "type": ["integer", "null"]
-                    },
+                    "body_weight": {"type": ["integer", "null"]},
+                    "body_weight_change": {"type": ["integer", "null"]},
 
-                    "starts_since_long_break": {
-                        "type": ["integer", "null"]
+                    "training": {
+                        "type": "object",
+                        "properties": {
+                            "course": {"type": ["string", "null"]},
+                            "time_6f": {"type": ["number", "null"]},
+                            "time_5f": {"type": ["number", "null"]},
+                            "time_4f": {"type": ["number", "null"]},
+                            "time_3f": {"type": ["number", "null"]},
+                            "time_1f": {"type": ["number", "null"]},
+                            "final_3f": {"type": ["number", "null"]},
+                            "final_1f": {"type": ["number", "null"]},
+                            "training_comment": {"type": ["string", "null"]},
+                        },
+                        "required": [
+                            "course", "time_6f", "time_5f", "time_4f",
+                            "time_3f", "time_1f", "final_3f", "final_1f",
+                            "training_comment"
+                        ],
                     },
 
                     "previous_races": {
@@ -130,87 +107,44 @@ RACE_SCHEMA = {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "date": {"type": "string"},
-                                "racecourse": {"type": "string"},
-                                "surface": {"type": "string"},
+                                "race_date": {"type": ["string", "null"]},
+                                "course": {"type": ["string", "null"]},
+                                "surface": {"type": ["string", "null"]},
                                 "distance_m": {"type": ["integer", "null"]},
-                                "track_condition": {"type": "string"},
-                                "class_name": {"type": "string"},
+                                "track_condition": {"type": ["string", "null"]},
+                                "class_name": {"type": ["string", "null"]},
                                 "finish_position": {"type": ["integer", "null"]},
                                 "field_size": {"type": ["integer", "null"]},
                                 "time_diff_sec": {"type": ["number", "null"]},
-                                "body_weight": {"type": ["number", "null"]},
-                                "note": {"type": "string"},
+                                "body_weight": {"type": ["integer", "null"]},
+                                "note": {"type": ["string", "null"]},
                             },
                             "required": [
-                                "date",
-                                "racecourse",
-                                "surface",
-                                "distance_m",
-                                "track_condition",
-                                "class_name",
-                                "finish_position",
-                                "field_size",
-                                "time_diff_sec",
-                                "body_weight",
-                                "note",
+                                "race_date", "course", "surface", "distance_m",
+                                "track_condition", "class_name", "finish_position",
+                                "field_size", "time_diff_sec", "body_weight", "note"
                             ],
                         },
                     },
 
-                    "same_course_wins": {"type": ["integer", "null"]},
-                    "same_course_places": {"type": ["integer", "null"]},
-                    "same_distance_best_finish": {"type": ["integer", "null"]},
-                    "same_distance_starts": {"type": ["integer", "null"]},
-                    "same_distance_places": {"type": ["integer", "null"]},
-                    "same_surface_places": {"type": ["integer", "null"]},
-                    "same_track_condition_places": {"type": ["integer", "null"]},
-
-                    "training_rating": {
-                        "type": "string",
-                        "enum": ["S", "A", "B", "C", "D", "不明"],
+                    "pedigree": {
+                        "type": "object",
+                        "properties": {
+                            "sire": {"type": ["string", "null"]},
+                            "dam_sire": {"type": ["string", "null"]},
+                        },
+                        "required": ["sire", "dam_sire"],
                     },
-                    "training_comment": {"type": "string"},
-
-                    "jockey_course_record_rating": {
-                        "type": "string",
-                        "enum": ["S", "A", "B", "C", "D", "不明"],
-                    },
-                    "jockey_change_rating": {
-                        "type": "string",
-                        "enum": ["大幅プラス", "プラス", "中立", "マイナス", "大幅マイナス", "不明"],
-                    },
-
-                    "pedigree_rating": {
-                        "type": "string",
-                        "enum": ["S", "A", "B", "C", "D", "不明"],
-                    },
-
+                    "jockey_course_record_text": {"type": ["string", "null"]},
+                    "jockey_change_text": {"type": ["string", "null"]},
                     "odds": {"type": ["number", "null"]},
                 },
                 "required": [
-                    "horse_number",
-                    "frame_number",
-                    "horse_name",
-                    "jockey",
-                    "trainer",
-                    "running_style",
-                    "days_since_last_race",
-                    "starts_since_long_break",
-                    "previous_races",
-                    "same_course_wins",
-                    "same_course_places",
-                    "same_distance_best_finish",
-                    "same_distance_starts",
-                    "same_distance_places",
-                    "same_surface_places",
-                    "same_track_condition_places",
-                    "training_rating",
-                    "training_comment",
-                    "jockey_course_record_rating",
-                    "jockey_change_rating",
-                    "pedigree_rating",
-                    "odds",
+                    "horse_number", "frame_number", "horse_name", "jockey_name",
+                    "running_style", "days_since_last_race", "body_weight",
+                    "body_weight_change", "training", "previous_races",
+                    "pedigree", "jockey_course_record_text",
+                    "jockey_change_text", "odds"
                 ],
             },
         },
@@ -218,712 +152,532 @@ RACE_SCHEMA = {
     "required": ["race", "horses"],
 }
 
+PROMPT = r"""
+あなたは競馬新聞のOCR・データ入力担当です。採点担当ではありません。
 
-EXTRACTION_PROMPT = r"""
-あなたは競馬新聞の画像から「事実を正確に構造化するOCR/データ抽出担当」です。
-あなたは予想家ではありません。採点・順位付け・勝敗予測は絶対にしないでください。
+画像に書かれている情報だけをJSONにしてください。
+絶対に推測・補完・外部検索・一般知識による評価をしないでください。
 
-【最重要ルール】
-1. 画像に書かれている情報だけを使う。
-2. 読めない情報・画像に存在しない情報は null または「不明」にする。
-3. 推測・補完・Web検索・一般知識による穴埋めは禁止。
-4. 複数画像が同じ馬を示している場合は相互参照し、明らかな重複を統合する。
-5. 数字を読み間違えない。特に着順、着差、馬番、枠番、距離、日付、馬体重、調教時計を慎重に確認。
-6. 「休み明け」は前走からの日数を読み取れる場合だけ計算する。
-7. 長期休養馬について、休養前の最後のレースを previous_races に残す。
-8. 叩き2走目/3走目は、画像から判断できる場合だけ starts_since_long_break に入れる。
-9. 鉄砲実績は、画像に明確に記載がある場合のみ判断材料にする。
-10. 騎手のコース成績は、画像に掲載されている場合だけ評価ランクを付ける。それ以外は「不明」。
-11. 血統評価も画像から読み取れる血統情報に基づく範囲だけ。見えない父母系を想像しない。
-12. odds は画像にオッズが掲載されている場合のみ数値を入れる。
-
-【previous_races】
-可能な限り馬柱に表示されている過去走を時系列で抽出してください。
-finish_position は着順。
-time_diff_sec は1着馬またはそのレースの基準からの着差が「0.3」のように秒表示されている場合の数値。画像が「クビ」「ハナ」「アタマ」「1/2」など秒でない場合は null。
-note には、不利・出遅れ・前崩れ・Hペース先行・Sペース前残り等が明記されている場合のみ記載。
-
-【running_style】
-画像内の通過順位等から明確に判断できる場合に分類。
-不明なら「不明」。
-
-必ず指定されたJSON Schemaに従って出力してください。
+重要:
+- 読めない数字は null。
+- 複数画像は相互参照し、同じ馬を統合。
+- 馬の評価、順位、印、能力点は作らない。
+- previous_races は集計せず、読めるレースを1行ずつ保存。
+- 長期休養馬は休養前のレースをできるだけ残す。
+- 調教時計は見える数値をそのまま保存。
+- 馬体重と増減があればそのまま保存。
+- 脚質は紙面に明記された場合だけ。
+- 騎手成績・血統適性を名前から推測しない。
+- オッズは紙面に表示されている場合だけ。
 """
 
 
-# ============================================================
-# 共通ユーティリティ
-# ============================================================
-
-def clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
-
-
-def safe_float(value: Any) -> Optional[float]:
-    if value is None:
-        return None
+# ---------------------------------------------------------
+# 基本計算
+# ---------------------------------------------------------
+def num(v):
     try:
-        return float(value)
-    except (ValueError, TypeError):
+        return float(v)
+    except Exception:
         return None
 
 
-def safe_int(value: Any) -> Optional[int]:
-    if value is None:
-        return None
+def integer(v):
     try:
-        return int(value)
-    except (ValueError, TypeError):
+        return int(v)
+    except Exception:
         return None
 
 
-def rating_to_score(rating: str, mapping: Dict[str, float], unknown: float) -> float:
-    return mapping.get(rating, unknown)
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
 
 
-def race_interval_category(days: Optional[int]) -> str:
-    if days is None:
-        return "不明"
-    if days < 0:
-        return "不明"
-    if days <= 60:
-        return "通常"
-    if days <= 150:
-        return "軽い休養"
-    if days <= 270:
-        return "長期休養"
-    return "超長期休養"
+def percentile(values, value, higher_is_better=True):
+    vals = [x for x in values if x is not None]
+    if value is None or not vals:
+        return 50.0
+    if len(vals) == 1:
+        return 50.0
+    if not higher_is_better:
+        value = -value
+        vals = [-x for x in vals]
+    below = sum(x < value for x in vals)
+    equal = sum(x == value for x in vals)
+    return 100.0 * (below + 0.5 * equal) / len(vals)
 
 
-def rank_from_total(total: float) -> str:
-    if total >= 90.0:
-        return "S"
-    if total >= 85.0:
-        return "A+"
-    if total >= 80.0:
-        return "A"
-    if total >= 75.0:
-        return "B+"
-    if total >= 70.0:
-        return "B"
-    if total >= 65.0:
-        return "C+"
-    if total >= 60.0:
-        return "C"
-    return "D"
+def race_relevance(r, race):
+    score = 0
+    if race.get("course") and r.get("course") == race["course"]:
+        score += 3
+    d = integer(r.get("distance_m"))
+    target = integer(race.get("distance_m"))
+    if d is not None and target is not None:
+        diff = abs(d - target)
+        if diff == 0:
+            score += 3
+        elif diff <= 200:
+            score += 2
+        elif diff <= 400:
+            score += 1
+    if race.get("surface") and r.get("surface") == race["surface"]:
+        score += 2
+    if race.get("track_condition") and r.get("track_condition") == race["track_condition"]:
+        score += 1
+    return score
 
 
-# ============================================================
-# 採点エンジン
-# ============================================================
+def result_quality(r):
+    pos = integer(r.get("finish_position"))
+    n = integer(r.get("field_size"))
+    diff = num(r.get("time_diff_sec"))
 
-def score_ability(horse: Dict[str, Any], race: Dict[str, Any]) -> tuple[float, List[str]]:
-    """
-    20点。
-    休み明けの場合は「前走だけ」に依存しない。
-    叩き補正はここで最終20点以内に収める。
-    """
-    notes = []
+    if pos is None:
+        return None
+
+    if pos == 1:
+        s = 1.00
+    elif pos == 2:
+        s = 0.92
+    elif pos == 3:
+        s = 0.86
+    elif pos <= 5:
+        s = 0.76
+    elif pos <= 8:
+        s = 0.63
+    elif pos <= 12:
+        s = 0.48
+    else:
+        s = 0.30
+
+    # 着差が小さい凡走を少し救済
+    if diff is not None:
+        if diff <= 0.2:
+            s += 0.08
+        elif diff <= 0.5:
+            s += 0.04
+        elif diff >= 1.5:
+            s -= 0.08
+
+    # 大頭数で上位に来た場合を少し評価
+    if n and n >= 14 and pos <= 5:
+        s += 0.04
+
+    return clamp(s, 0.0, 1.0)
+
+
+def score_ability(horse, race):
     races = horse.get("previous_races") or []
+    usable = []
+    for r in races[:8]:
+        q = result_quality(r)
+        if q is not None:
+            usable.append((r, q))
 
-    days = safe_int(horse.get("days_since_last_race"))
-    category = race_interval_category(days)
+    if not usable:
+        return 10.0
 
+    # 現条件への関連度と新しさを組み合わせる
+    weighted = []
+    for i, (r, q) in enumerate(usable):
+        recency_w = max(1.0, 5.0 - i * 0.55)
+        relevance_w = 1.0 + 0.08 * race_relevance(r, race)
+        weighted.append((q, recency_w * relevance_w))
+
+    avg = sum(q * w for q, w in weighted) / sum(w for _, w in weighted)
+    score = avg * 20.0
+
+    days = integer(horse.get("days_since_last_race"))
+    if days is not None:
+        # 長期休養を能力の大幅減点にはしない
+        if days >= 300:
+            score *= 0.95
+        elif days >= 180:
+            score *= 0.98
+
+    return round(clamp(score, 0, 20), 1)
+
+
+def score_suitability(horse, race):
+    races = horse.get("previous_races") or []
     if not races:
-        notes.append("過去走情報不足")
-        return 8.0, notes
+        return 9.0
 
-    # 着順＋着差を基本にした直近実績評価
-    recent = races[:3]
+    course, dist, surf, cond = [], [], [], []
+    target_d = integer(race.get("distance_m"))
 
-    def race_quality(r: Dict[str, Any]) -> float:
-        pos = safe_int(r.get("finish_position"))
-        field = safe_int(r.get("field_size"))
-        diff = safe_float(r.get("time_diff_sec"))
+    for r in races:
+        q = result_quality(r)
+        if q is None:
+            continue
+        if race.get("course") and r.get("course") == race["course"]:
+            course.append(q)
+        if target_d and integer(r.get("distance_m")) is not None:
+            if abs(integer(r.get("distance_m")) - target_d) <= 200:
+                dist.append(q)
+        if race.get("surface") and r.get("surface") == race["surface"]:
+            surf.append(q)
+        if race.get("track_condition") and r.get("track_condition") == race["track_condition"]:
+            cond.append(q)
 
-        if pos is None:
-            return 3.0
+    def part(a, default=0.5):
+        return sum(a) / len(a) if a else default
 
-        # 着順ベース
-        if pos == 1:
-            score = 8.0
-        elif pos == 2:
-            score = 7.0
-        elif pos == 3:
-            score = 6.5
-        elif pos <= 5:
-            score = 5.5
-        elif pos <= 8:
-            score = 4.0
-        elif pos <= 12:
-            score = 2.5
+    # 18点: 5 + 5 + 4 + 4
+    score = (
+        part(course) * 5
+        + part(dist) * 5
+        + part(surf) * 4
+        + part(cond) * 4
+    )
+    return round(clamp(score, 0, 18), 1)
+
+
+def training_metric(horse):
+    t = horse.get("training") or {}
+    # 短い時計ほど速い。ただし「何の時計か」を混ぜない。
+    # 主に4F/3F/1Fの存在を品質指標にする。
+    metrics = []
+    for key in ["time_4f", "time_3f", "time_1f", "final_3f", "final_1f"]:
+        v = num(t.get(key))
+        if v is not None:
+            metrics.append((key, v))
+
+    if not metrics:
+        return None
+
+    # 時計の種類ごとにレース内順位を後段で正規化するため、
+    # ここでは値の平均を返さない。
+    return metrics
+
+
+def score_training_all(horses):
+    # 全馬比較。数字のある馬だけを順位化し、欠損は中立。
+    per_horse = {id(h): [] for h in horses}
+
+    for key in ["time_4f", "time_3f", "time_1f", "final_3f", "final_1f"]:
+        vals = [(h, num((h.get("training") or {}).get(key))) for h in horses]
+        vals = [(h, v) for h, v in vals if v is not None]
+        if not vals:
+            continue
+        raw = [v for _, v in vals]
+        for h, v in vals:
+            p = percentile(raw, v, higher_is_better=False)
+            per_horse[id(h)].append(p)
+
+    out = {}
+    for h in horses:
+        ps = per_horse[id(h)]
+        if not ps:
+            out[id(h)] = 8.5
+            continue
+        p = sum(ps) / len(ps)
+        # 0～17点
+        out[id(h)] = round(clamp(17.0 * p / 100.0, 0, 17), 1)
+    return out
+
+
+def score_condition(horse):
+    """
+    調教点に状態要素を混ぜる。
+    馬体重増減は単独で悪とせず、極端な増減だけ小さく注意。
+    """
+    base = 8.5
+    change = integer(horse.get("body_weight_change"))
+    if change is not None:
+        if -4 <= change <= 6:
+            base += 1.0
+        elif -8 <= change <= 10:
+            base += 0.0
         else:
-            score = 1.5
-
-        # 着差が読み取れる場合だけ補正
-        if diff is not None:
-            if diff <= 0.2:
-                score += 1.5
-            elif diff <= 0.5:
-                score += 1.0
-            elif diff <= 1.0:
-                score += 0.0
-            elif diff <= 1.5:
-                score -= 0.5
-            else:
-                score -= 1.0
-
-        # 大頭数での掲示板をわずかに評価
-        if field and field >= 14 and pos <= 5:
-            score += 0.3
-
-        # 明記されたレース内容
-        note = str(r.get("note") or "")
-        if any(x in note for x in ["不利", "出遅れ", "前崩れ", "Hペース先行", "ハイペース先行"]):
-            score += 0.4
-
-        if any(x in note for x in ["展開有利", "前残り", "楽逃げ"]):
-            score -= 0.2
-
-        return clamp(score, 0.0, 10.0)
-
-    qualities = [race_quality(r) for r in recent]
-
-    # 通常馬：直近走を強く見る
-    if category in ["通常", "軽い休養"]:
-        base = qualities[0] * 0.45
-        if len(qualities) >= 2:
-            base += qualities[1] * 0.30
-        if len(qualities) >= 3:
-            base += qualities[2] * 0.25
-    else:
-        # 長期休養：直近＝休養前の最後のレースだけにしない
-        # 休養前の複数実績＋同条件実績を混ぜる
-        base = qualities[0] * 0.25
-        if len(qualities) >= 2:
-            base += qualities[1] * 0.35
-        if len(qualities) >= 3:
-            base += qualities[2] * 0.40
-        notes.append(f"{category}:休養前実績を重視")
-
-    # 10点スケール→20点
-    result = base * 2.0
-
-    # 同条件実績
-    same_course = safe_int(horse.get("same_course_wins"))
-    same_course_places = safe_int(horse.get("same_course_places"))
-    same_distance_places = safe_int(horse.get("same_distance_places"))
-
-    if same_course is not None and same_course > 0:
-        result += 0.8
-        notes.append("同コース勝利実績あり")
-    elif same_course_places is not None and same_course_places > 0:
-        result += 0.4
-
-    if same_distance_places is not None and same_distance_places > 0:
-        result += 0.4
-
-    # 叩き2/3走目
-    starts = safe_int(horse.get("starts_since_long_break"))
-    if starts == 2:
-        # 「上積みあり」と断定せず、調教等の別項目で仕上がりを評価。
-        # ここでは小幅な上積みだけ。
-        result += 0.5
-        notes.append("叩き2走目")
-    elif starts == 3:
-        notes.append("叩き3走目")
-
-    return round(clamp(result, 0.0, 20.0), 1), notes
+            base -= 1.0
+    return clamp(base, 0, 17)
 
 
-def score_suitability(horse: Dict[str, Any], race: Dict[str, Any]) -> tuple[float, List[str]]:
-    notes = []
-
-    course_places = safe_int(horse.get("same_course_places"))
-    distance_starts = safe_int(horse.get("same_distance_starts"))
-    distance_places = safe_int(horse.get("same_distance_places"))
-    surface_places = safe_int(horse.get("same_surface_places"))
-    track_places = safe_int(horse.get("same_track_condition_places"))
-
-    # コース 6点
-    if course_places is None:
-        course = 3.0
-    elif course_places >= 3:
-        course = 6.0
-        notes.append("同コース好走実績")
-    elif course_places >= 1:
-        course = 4.5
-        notes.append("同コース好走あり")
-    else:
-        course = 2.0
-
-    # 距離 6点
-    if distance_starts is None:
-        distance = 3.0
-    elif distance_places is None:
-        distance = 3.0
-    elif distance_places >= 3:
-        distance = 6.0
-        notes.append("距離実績良好")
-    elif distance_places >= 1:
-        distance = 4.5
-    else:
-        distance = 2.0
-
-    # 馬場 6点
-    if track_places is None:
-        track = 3.0
-    elif track_places >= 2:
-        track = 6.0
-        notes.append("今回馬場で好走実績")
-    elif track_places == 1:
-        track = 4.5
-    else:
-        track = 2.0
-
-    # 芝/ダートなどの情報が画像にある場合の補助
-    if surface_places is not None and surface_places > 0:
-        track = min(6.0, track + 0.3)
-
-    return round(clamp(course + distance + track, 0.0, 18.0), 1), notes
-
-
-def score_training(horse: Dict[str, Any]) -> tuple[float, List[str]]:
-    mapping = {
-        "S": 16.5,
-        "A": 14.5,
-        "B": 12.0,
-        "C": 8.0,
-        "D": 3.0,
-        "不明": 8.5,
-    }
-    rating = horse.get("training_rating", "不明")
-    score = mapping.get(rating, 8.5)
-    notes = []
-
-    if rating in ["S", "A"]:
-        notes.append("調教・仕上がり良好")
-    elif rating in ["C", "D"]:
-        notes.append("調教面に不安")
-
-    days = safe_int(horse.get("days_since_last_race"))
-    if days is not None and days >= 151:
-        notes.append("休み明けの仕上がりを重視")
-        comment = str(horse.get("training_comment") or "")
-        if any(x in comment for x in ["仕上がり十分", "万全", "絶好", "抜群", "順調"]):
-            score = min(17.0, score + 0.5)
-        elif any(x in comment for x in ["余裕", "叩き", "試走", "途上"]):
-            score = max(0.0, score - 1.0)
-
-    return round(clamp(score, 0.0, 17.0), 1), notes
-
-
-def score_pace(horses: List[Dict[str, Any]]) -> tuple[Dict[int, float], str]:
-    """
-    全馬の脚質構成からS/M/Hを固定ルールで推定。
-    """
-    styles = [h.get("running_style") for h in horses]
+def score_pace(horse, horses):
+    styles = [(h.get("running_style") or "不明") for h in horses]
+    style = horse.get("running_style") or "不明"
 
     escape = styles.count("逃げ")
     front = styles.count("先行")
-    pace_count = escape + front
+    fast_front = escape + front
 
-    if escape >= 3 or pace_count >= 6:
-        pace = "H"
-    elif escape == 0 and pace_count <= 2:
-        pace = "S"
-    else:
-        pace = "M"
-
-    scores = {}
-    for h in horses:
-        num = safe_int(h.get("horse_number"))
-        style = h.get("running_style", "不明")
-
-        if pace == "H":
-            value = {
-                "逃げ": 8.0,
-                "先行": 10.0,
-                "好位": 12.0,
-                "差し": 14.0,
-                "追込": 13.0,
-                "不明": 10.0,
-            }.get(style, 10.0)
-        elif pace == "S":
-            value = {
-                "逃げ": 15.0,
-                "先行": 14.0,
-                "好位": 13.0,
-                "差し": 10.0,
-                "追込": 8.0,
-                "不明": 10.0,
-            }.get(style, 10.0)
-        else:
-            value = {
-                "逃げ": 11.5,
-                "先行": 12.5,
-                "好位": 13.0,
-                "差し": 12.5,
-                "追込": 10.5,
-                "不明": 10.0,
-            }.get(style, 10.0)
-
-        if num is not None:
-            scores[num] = round(clamp(value, 0.0, 15.0), 1)
-
-    return scores, pace
+    # 逃げが複数なら差し・追込を相対的に評価
+    if style == "逃げ":
+        return 7.0 if escape >= 2 else 12.0
+    if style == "先行":
+        return 10.0 if escape >= 2 else 13.0
+    if style == "差し":
+        return 14.0 if escape >= 2 or fast_front >= 5 else 12.0
+    if style == "追込":
+        return 14.0 if escape >= 2 or fast_front >= 6 else 10.0
+    return 10.0
 
 
-def score_jockey(horse: Dict[str, Any]) -> tuple[float, List[str]]:
-    course_mapping = {
-        "S": 8.0,
-        "A": 7.0,
-        "B": 5.5,
-        "C": 4.0,
-        "D": 2.5,
-        "不明": 5.5,
-    }
-    change_mapping = {
-        "大幅プラス": 3.0,
-        "プラス": 1.5,
-        "中立": 0.0,
-        "マイナス": -1.0,
-        "大幅マイナス": -2.0,
-        "不明": 0.0,
-    }
+def score_jockey(horse):
+    text = " ".join([
+        horse.get("jockey_course_record_text") or "",
+        horse.get("jockey_change_text") or "",
+    ])
+    if not text:
+        return 6.0
 
-    base = course_mapping.get(horse.get("jockey_course_record_rating"), 5.5)
-    change = change_mapping.get(horse.get("jockey_change_rating"), 0.0)
-
-    return round(clamp(base + change, 0.0, 12.0), 1), []
+    nums = []
+    for x in re.findall(r"(\d+(?:\.\d+)?)\s*%", text):
+        nums.append(float(x))
+    if nums:
+        p = max(nums)
+        if p >= 40: return 11.0
+        if p >= 30: return 10.0
+        if p >= 20: return 8.5
+        if p >= 10: return 7.0
+        return 5.5
+    return 7.0
 
 
-def score_pedigree(horse: Dict[str, Any]) -> tuple[float, List[str]]:
-    mapping = {
-        "S": 9.5,
-        "A": 8.0,
-        "B": 6.0,
-        "C": 4.0,
-        "D": 2.0,
-        "不明": 5.0,
-    }
-    return round(clamp(mapping.get(horse.get("pedigree_rating"), 5.0), 0.0, 10.0), 1), []
+def score_pedigree(horse):
+    p = horse.get("pedigree") or {}
+    if p.get("sire") or p.get("dam_sire"):
+        return 6.0
+    return 5.0
 
 
-def score_gate(horse: Dict[str, Any], race: Dict[str, Any]) -> tuple[float, List[str]]:
-    """
-    枠順はコースごとの厳密な統計をまだ外部データ化していないため、
-    画像から得られる馬番・枠番をベースに中立寄りにする。
-    コース別バイアス統計を接続した段階でここを差し替える。
-    """
-    frame = safe_int(horse.get("frame_number"))
-    horse_num = safe_int(horse.get("horse_number"))
-
+def score_gate(horse):
+    frame = integer(horse.get("frame_number"))
     if frame is None:
-        return 4.0, ["枠順情報不明"]
-
-    # 現段階では極端な決め打ちを避ける。
-    # 内外有利はコース別DBを導入したときに補正する。
-    score = 4.0
-
-    # 内枠をわずかに中立以上、外枠をわずかに中立以下。
-    # これは暫定値。
+        return 4.0
     if frame <= 2:
-        score = 4.5
-    elif frame >= 7:
-        score = 3.5
+        return 4.5
+    if frame >= 7:
+        return 3.5
+    return 4.0
 
-    return round(clamp(score, 0.0, 8.0), 1), []
+
+def rank_label(x):
+    if x >= 85: return "S"
+    if x >= 80: return "A+"
+    if x >= 75: return "A"
+    if x >= 70: return "B+"
+    if x >= 65: return "B"
+    if x >= 60: return "C+"
+    if x >= 55: return "C"
+    return "D"
 
 
-# ============================================================
-# 期待値・印
-# ============================================================
-
-def fair_probability_from_score(total: float) -> float:
+def estimate_win_probability(results):
     """
-    100点をそのまま勝率と解釈しない。
-    現段階では「能力順位」を確率化するための暫定softmax用スコア。
+    総合点を指数変換して相対的な参考勝率を作る。
+    公的な勝率ではない。オッズ期待値の試算用。
     """
-    return total / 100.0
+    import math
+    exps = [math.exp((r["total"] - max(x["total"] for x in results)) / 5.0) for r in results]
+    s = sum(exps)
+    for r, e in zip(results, exps):
+        r["model_win_prob"] = round(100.0 * e / s, 1)
 
 
-def calculate_marks(results: List[HorseResult]) -> None:
-    """
-    能力点＋オッズで最終印を決定。
-    オッズがない場合は能力順位を使用。
-    """
-    # 能力順位
-    sorted_by_score = sorted(
-        results,
-        key=lambda x: (-x.score.total, x.horse_number or 999)
-    )
-
-    # オッズがコード側に保持されていないため、notesからではなく
-    # 今後HorseResultへ odds を追加して扱うのが理想。
-    # 現在は能力点のみで印を付ける。
-    marks = ["◎", "○", "▲", "☆", "△", "◇"]
-
-    for i, result in enumerate(sorted_by_score):
-        result.mark = marks[i] if i < len(marks) else ""
+def add_marks(results):
+    for i, r in enumerate(results):
+        r["mark"] = ["◎", "○", "▲", "△"][i] if i < 4 else ""
 
 
-def analyze_race(data: Dict[str, Any]) -> tuple[Dict[str, Any], List[HorseResult]]:
-    race = data.get("race", {})
-    horses = data.get("horses", [])
-
-    pace_scores, pace_type = score_pace(horses)
-    results: List[HorseResult] = []
-
-    for horse in horses:
-        ability, n1 = score_ability(horse, race)
-        suitability, n2 = score_suitability(horse, race)
-        training, n3 = score_training(horse)
-        jockey, n5 = score_jockey(horse)
-        pedigree, n6 = score_pedigree(horse)
-        gate, n7 = score_gate(horse, race)
-
-        num = safe_int(horse.get("horse_number"))
-        pace = pace_scores.get(num, 10.0)
-
-        score = Score(
-            ability=ability,
-            suitability=suitability,
-            training=training,
-            pace=pace,
-            jockey=jockey,
-            pedigree=pedigree,
-            gate=gate,
-        )
-
-        results.append(
-            HorseResult(
-                horse_number=num,
-                horse_name=str(horse.get("horse_name") or "不明"),
-                score=score,
-                rank=rank_from_total(score.total),
-                mark="",
-                notes=n1 + n2 + n3 + n5 + n6 + n7,
-            )
-        )
-
-    results.sort(key=lambda x: (-x.score.total, x.horse_number or 999))
-    calculate_marks(results)
-
-    return {"race": race, "pace": pace_type}, results
+def calculate_expected_value(results):
+    for r in results:
+        odds = num(r.get("odds"))
+        p = r.get("model_win_prob")
+        if odds and p:
+            # 単純化した参考値: 推定勝率 × オッズ
+            r["expected_value"] = round((p / 100.0) * odds, 2)
+        else:
+            r["expected_value"] = None
 
 
-# ============================================================
-# Gemini呼び出し
-# ============================================================
-
-def get_api_key() -> str:
-    try:
-        return st.secrets["GEMINI_API_KEY"]
-    except Exception:
-        return os.getenv("GEMINI_API_KEY", "")
+def extract_json(text):
+    t = (text or "").strip()
+    if t.startswith("```"):
+        t = t.replace("```json", "").replace("```", "").strip()
+    return json.loads(t)
 
 
-def extract_race_data(client: genai.Client, uploaded_files: List[Any]) -> Dict[str, Any]:
-    content_parts: List[Any] = []
-
-    for uploaded_file in uploaded_files:
-        content_parts.append(
-            types.Part.from_bytes(
-                data=uploaded_file.getvalue(),
-                mime_type=uploaded_file.type,
-            )
-        )
-
-    content_parts.append(EXTRACTION_PROMPT)
-
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=content_parts,
-        config=types.GenerateContentConfig(
-            temperature=AI_TEMPERATURE,
-            response_mime_type="application/json",
-            response_schema=RACE_SCHEMA,
-        ),
-    )
-
-    text = response.text.strip()
-
-    # JSONとして厳格に処理
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        # ```json ... ``` が返った場合のみ安全に除去
-        cleaned = re.sub(r"^```json\s*", "", text, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s*```$", "", cleaned)
-        return json.loads(cleaned)
-
-
-# ============================================================
+# ---------------------------------------------------------
 # UI
-# ============================================================
+# ---------------------------------------------------------
+st.set_page_config(page_title="馬柱＆予想支援 v4", layout="wide")
+st.title("🏇 馬柱 ＆ 予想支援アプリ v4")
+st.caption("AIは事実抽出。100点採点・順位・印・期待値はPythonの固定計算です。")
 
-st.set_page_config(
-    page_title=APP_TITLE,
-    page_icon="🏇",
-    layout="wide",
-)
+try:
+    api_key = st.secrets["GEMINI_API_KEY"]
+except Exception:
+    api_key = st.sidebar.text_input("Gemini APIキー", type="password")
 
-st.title("🏇 馬柱 ＆ 予想支援アプリ")
-st.caption(
-    "画像から事実を抽出 → Pythonの固定ルールで100点採点。"
-    "AIに最終点数を自由に決めさせないことで、結果のブレを抑えます。"
-)
+st.sidebar.subheader("100点配分")
+for k, v in WEIGHTS.items():
+    st.sidebar.write(f"{k}: {v:g}点")
 
-with st.sidebar:
-    st.header("設定")
-    api_key = get_api_key()
-
-    if not api_key:
-        api_key = st.text_input(
-            "Gemini APIキー",
-            type="password",
-            help="Streamlit Secretsまたは環境変数 GEMINI_API_KEY も利用できます。",
-        )
-
-    st.divider()
-    st.write("配点")
-    st.write("① 能力・実績 20")
-    st.write("② コース・距離・馬場 18")
-    st.write("③ 調教・仕上がり 17")
-    st.write("④ 脚質・展開 15")
-    st.write("⑤ 騎手 12")
-    st.write("⑥ 血統 10")
-    st.write("⑦ 枠順 8")
-
-if not api_key:
-    st.info("Gemini APIキーを設定してください。")
-    st.stop()
-
-client = genai.Client(api_key=api_key)
-
-uploaded_files = st.file_uploader(
-    "競馬新聞・馬柱の画像を選択（全体＋拡大画像など複数可）",
+files = st.file_uploader(
+    "競馬新聞・馬柱の画像（全体＋拡大を複数推奨）",
     type=["jpg", "jpeg", "png", "webp"],
     accept_multiple_files=True,
 )
 
-if uploaded_files:
-    cols = st.columns(min(3, len(uploaded_files)))
-    for i, uploaded_file in enumerate(uploaded_files):
+if files:
+    cols = st.columns(min(4, len(files)))
+    for i, f in enumerate(files):
         with cols[i % len(cols)]:
-            st.image(
-                uploaded_file,
-                caption=uploaded_file.name,
-                use_container_width=True,
+            st.image(f, caption=f.name, use_container_width=True)
+
+run = st.button(
+    "🔍 解析 → 固定ルール採点",
+    type="primary",
+    disabled=not (api_key and files),
+)
+
+if run:
+    try:
+        client = genai.Client(api_key=api_key)
+        contents = []
+        for f in files:
+            contents.append(types.Part.from_bytes(data=f.getvalue(), mime_type=f.type))
+        contents.append(PROMPT)
+
+        with st.spinner("Geminiが画像から事実データを抽出しています…"):
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    temperature=TEMPERATURE,
+                    response_mime_type="application/json",
+                    response_schema=SCHEMA,
+                ),
             )
 
-    if st.button("🔍 解析して100点採点", type="primary"):
-        try:
-            with st.spinner("画像から事実データを抽出しています…"):
-                data = extract_race_data(client, uploaded_files)
+        data = extract_json(response.text)
+        race = data.get("race", {})
+        horses = data.get("horses", [])
 
-            with st.spinner("固定ルールで採点しています…"):
-                race_info, results = analyze_race(data)
-
-            st.session_state["race_info"] = race_info
-            st.session_state["results"] = results
-            st.session_state["raw_data"] = data
-
-        except Exception as e:
-            st.error(f"解析エラー: {e}")
+        if not horses:
+            st.error("馬データを取得できませんでした。")
             st.stop()
 
-if "results" in st.session_state:
-    race_info = st.session_state["race_info"]
-    results: List[HorseResult] = st.session_state["results"]
-    data = st.session_state["raw_data"]
+        training_scores = score_training_all(horses)
 
-    race = race_info["race"]
+        results = []
+        for h in horses:
+            ability = score_ability(h, race)
+            suitability = score_suitability(h, race)
+            training = training_scores.get(id(h), 8.5)
+            condition = score_condition(h)
 
-    st.divider()
-    st.subheader("📍 対象レース")
-    st.write(
-        f"**{race.get('racecourse', '不明')} "
-        f"{race.get('race_number', '?')}R "
-        f"{race.get('race_name', '')}**"
-    )
-    st.write(
-        f"{race.get('surface', '不明')} "
-        f"{race.get('distance_m', '?')}m / "
-        f"馬場：{race.get('track_condition', '不明')} / "
-        f"想定ペース：**{race_info['pace']}**"
-    )
+            # 調教17点のうち、時計14点＋状態3点
+            training_final = clamp(training * (14.0 / 17.0) + condition * (3.0 / 17.0), 0, 17)
 
-    st.subheader("📊 総合評価ランキング")
+            pace = score_pace(h, horses)
+            jockey = score_jockey(h)
+            pedigree = score_pedigree(h)
+            gate = score_gate(h)
 
-    for i, result in enumerate(results, start=1):
-        c1, c2, c3, c4 = st.columns([0.6, 2.4, 1.2, 3.8])
-
-        with c1:
-            st.write(f"**{i}**")
-
-        with c2:
-            st.write(
-                f"**{result.mark} {result.horse_number}番 "
-                f"{result.horse_name}**"
+            total = round(
+                ability + suitability + training_final
+                + pace + jockey + pedigree + gate, 1
             )
 
-        with c3:
-            st.write(
-                f"**{result.score.total:.1f}点**  "
-                f"`{result.rank}`"
-            )
+            results.append({
+                "horse_number": integer(h.get("horse_number")),
+                "frame_number": integer(h.get("frame_number")),
+                "horse_name": h.get("horse_name") or "不明",
+                "jockey_name": h.get("jockey_name") or "不明",
+                "odds": num(h.get("odds")),
+                "ability": round(ability, 1),
+                "suitability": round(suitability, 1),
+                "training": round(training_final, 1),
+                "pace": round(pace, 1),
+                "jockey": round(jockey, 1),
+                "pedigree": round(pedigree, 1),
+                "gate": round(gate, 1),
+                "total": total,
+            })
 
-        with c4:
-            if result.notes:
-                st.write(" / ".join(result.notes[:5]))
-            else:
-                st.write("—")
+        results.sort(key=lambda x: (
+            -x["total"],
+            x["odds"] if x["odds"] is not None else 999999,
+            x["horse_number"] if x["horse_number"] is not None else 999
+        ))
 
-    st.subheader("🎯 最終推奨印")
-    for result in results[:6]:
-        st.write(
-            f"**{result.mark} {result.horse_number}番 "
-            f"{result.horse_name}**　"
-            f"{result.score.total:.1f}点（{result.rank}）"
-        )
+        for i, r in enumerate(results, 1):
+            r["rank"] = i
 
-    st.subheader("🔎 各馬の採点内訳")
+        estimate_win_probability(results)
+        calculate_expected_value(results)
+        add_marks(results)
 
-    for result in results:
-        with st.expander(
-            f"{result.mark} {result.horse_number}番 "
-            f"{result.horse_name} — {result.score.total:.1f}点"
-        ):
-            s = result.score
-            cols = st.columns(7)
+        st.success(f"{len(results)}頭を固定ルールで採点しました。")
 
-            items = [
-                ("能力", s.ability, 20),
-                ("適性", s.suitability, 18),
-                ("調教", s.training, 17),
-                ("展開", s.pace, 15),
-                ("騎手", s.jockey, 12),
-                ("血統", s.pedigree, 10),
-                ("枠順", s.gate, 8),
-            ]
+        st.subheader("📊 総合ランキング")
+        table = []
+        for r in results:
+            table.append({
+                "順位": r["rank"],
+                "印": r["mark"],
+                "馬番": r["horse_number"],
+                "馬名": r["horse_name"],
+                "総合": r["total"],
+                "評価": rank_label(r["total"]),
+                "能力": r["ability"],
+                "適性": r["suitability"],
+                "調教・状態": r["training"],
+                "展開": r["pace"],
+                "騎手": r["jockey"],
+                "血統": r["pedigree"],
+                "枠順": r["gate"],
+                "オッズ": r["odds"],
+                "参考勝率": r["model_win_prob"],
+                "参考期待値": r["expected_value"],
+            })
+        st.dataframe(table, use_container_width=True, hide_index=True)
 
-            for col, (label, value, max_value) in zip(cols, items):
-                with col:
-                    st.metric(label, f"{value:.1f}", f"/ {max_value}")
+        st.subheader("🎯 予想の見方")
+        st.write("◎○▲△は総合点順位から機械的に決定。AIには印を決めさせていません。")
+        st.write("参考勝率・期待値は現時点のモデル値で、実際の市場確率や払戻を保証するものではありません。")
 
-            if result.notes:
-                st.write("**評価メモ:**")
-                for note in result.notes:
-                    st.write(f"- {note}")
+        st.subheader("🔎 馬ごとの詳細")
+        for r in results:
+            with st.expander(
+                f'{r["rank"]}位 {r["mark"]} {r["horse_name"]} — {r["total"]}点'
+            ):
+                st.write({
+                    "能力・近走": r["ability"],
+                    "コース・距離・馬場適性": r["suitability"],
+                    "調教・状態": r["training"],
+                    "脚質・展開": r["pace"],
+                    "騎手": r["jockey"],
+                    "血統": r["pedigree"],
+                    "枠順": r["gate"],
+                    "参考勝率": r["model_win_prob"],
+                    "参考期待値": r["expected_value"],
+                })
 
-    with st.expander("🧾 AIが抽出した元データ（検証用）"):
+        st.subheader("🧾 抽出された生データ")
+        st.info("採点結果より先に、ここを確認してください。読み取りが間違っていれば採点も間違います。")
         st.json(data)
 
-    st.caption(
-        "注意：現在の枠順補正・騎手成績・オッズ期待値は、"
-        "画像内情報だけで計算する暫定版です。"
-        "外部の競馬データを接続した段階で、コース別枠順統計・騎手統計・"
-        "オッズ期待値を独立したデータとして追加できます。"
-    )
+        st.download_button(
+            "生データJSONを保存",
+            json.dumps(data, ensure_ascii=False, indent=2),
+            "race_extracted_data.json",
+            "application/json",
+        )
+
+        st.download_button(
+            "採点結果JSONを保存",
+            json.dumps(results, ensure_ascii=False, indent=2),
+            "race_scored_results.json",
+            "application/json",
+        )
+
+    except Exception as e:
+        st.error(f"エラーが発生しました: {e}")
+        st.exception(e)
+else:
+    st.info("馬柱画像をアップロードしてください。")
