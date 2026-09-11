@@ -1,99 +1,41 @@
-[README.md](https://github.com/user-attachments/files/32093433/README.md)
-# 馬柱＆予想支援アプリ v4
+[README.md](https://github.com/user-attachments/files/32095181/README.md)
+# 馬柱＆予想支援アプリ v4.1
 
-## 目的
+v4で発生した **Schema validation error** を修正した版です。
 
-競馬新聞の画像をGeminiでデータ化し、その後の採点はPythonの固定ルールで行います。
+## v4.1の主な修正
 
-### 重要
+- `response_schema` から `response_json_schema` に変更
+- nullable項目を `anyOf` で定義
+- `running_style` の `null` 許容方法を修正
+- Google Gen AI SDKを新しいバージョンに固定
+- AIは画像から事実抽出だけ
+- 採点、順位、印、期待値はPython側で固定計算
 
-AIに「この馬は何点」「この馬が本命」と自由判断させません。
+## GitHubで置き換えるファイル
 
-```text
-画像
- ↓
-Gemini
- ↓
-事実データ(JSON)
- ↓
-Python固定計算
- ↓
-100点ランキング
- ↓
-◎ ○ ▲ △
- ↓
-参考勝率・期待値
-```
+- `app.py`
+- `requirements.txt`
+- `README.md`
 
-## v4の追加点
+`scoring_rules.md` はv4のものをそのまま使えます。
 
-- 調教時計を全馬比較
-- 近走着順を固定ルールで評価
-- 着差を評価
-- 同競馬場・距離・馬場の実績を評価
-- 長期休養を単純な大幅減点にしない
-- 馬体重増減を状態評価へ利用
-- 脚質頭数から展開を固定計算
-- オッズから参考期待値を計算
-- AIによる印の自由生成を廃止
-- 抽出JSONを画面で確認可能
-- JSONを保存可能
+## Streamlit Cloud
 
-## 採点
-
-| 項目 | 点 |
-|---|---:|
-| 能力・近走 | 20 |
-| コース・距離・馬場適性 | 18 |
-| 調教・状態 | 17 |
-| 脚質・展開 | 15 |
-| 騎手 | 12 |
-| 血統 | 10 |
-| 枠順 | 8 |
-| 合計 | 100 |
-
-## 実行
-
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-## APIキー
-
-GitHubにAPIキーをアップロードしないでください。
-
-Streamlit CloudのSecretsに:
+Secretsに以下を設定してください。
 
 ```toml
-GEMINI_API_KEY = "YOUR_API_KEY"
+GEMINI_API_KEY = "実際のAPIキー"
 ```
 
-## 注意
+APIキーはGitHubへアップロードしないでください。
 
-v4では外部競馬データベースをまだ接続していません。
+## テスト方法
 
-そのため、
+1. 同じ馬柱画像をアップロード
+2. 「解析 → 固定ルール採点」
+3. 下部の「Geminiが読み取った生データ」を確認
+4. 同じ画像でもう一度実行
+5. 生データと採点結果の再現性を比較
 
-- 枠順のコース別統計
-- 騎手の詳細成績
-- 血統の統計
-- 調教の公式比較データ
-- オッズのリアルタイム取得
-
-は今後の強化項目です。
-
-また、参考勝率はこのアプリ内の相対モデルであり、公的な勝率ではありません。
-
-## 次の段階
-
-Android版へ移行する場合は、
-
-- Kotlin
-- Jetpack Compose
-- Gemini API
-- 同じ固定採点エンジン
-- 競馬データAPI
-- ローカル履歴保存
-
-という構成を推奨します。
+採点部分は同じ入力データなら同じ結果になります。
