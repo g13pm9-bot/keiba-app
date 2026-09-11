@@ -1,0 +1,44 @@
+# Gemini APIキー・秘密情報
+
+.streamlit/secrets.toml
+.env
+.env.*
+
+# Python
+
+**pycache**/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
+# 仮想環境
+
+venv/
+.venv/
+env/
+
+# Streamlit
+
+.streamlit/secrets.toml
+
+# OS
+
+.DS_Store
+Thumbs.db
+
+# IDE / Editor
+
+.vscode/
+.idea/
+
+# 一時ファイル
+
+*.tmp
+*.temp
+*.log
+
+# ローカルで保存した解析結果
+
+race_extracted_data.json
+race_scored_results.json
