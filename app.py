@@ -27,7 +27,8 @@ import streamlit as st
 from google import genai
 from google.genai import types
 
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+MODEL_NAME = "gemini-3.6-flash"
+TEMPERATURE = 0.0
 
 WEIGHTS = {
     "能力・近走": 20.0,
@@ -502,9 +503,9 @@ def extract_json(text):
 # ---------------------------------------------------------
 # UI
 # ---------------------------------------------------------
-st.set_page_config(page_title="馬柱＆予想支援 v4", layout="wide")
-st.title("🏇 馬柱 ＆ 予想支援アプリ v4")
-st.caption("AIは事実抽出。100点採点・順位・印・期待値はPythonの固定計算です。")
+st.set_page_config(page_title="馬柱＆予想支援 v4.1", layout="wide")
+st.title("🏇 馬柱 ＆ 予想支援アプリ v4.1")
+st.caption("v4.1: Gemini 3.6 Flash対応。AIは事実抽出、採点はPythonの固定計算です。")
 
 try:
     api_key = st.secrets["GEMINI_API_KEY"]
@@ -545,10 +546,12 @@ if run:
             response = client.models.generate_content(
                 model=MODEL_NAME,
                 contents=contents,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=SCHEMA,
-                ),
+                config={
+                    "temperature": TEMPERATURE,
+                    "seed": 7,
+                    "response_mime_type": "application/json",
+                    "response_json_schema": SCHEMA,
+                },
             )
 
         data = extract_json(response.text)
