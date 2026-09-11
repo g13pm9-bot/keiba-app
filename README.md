@@ -1,41 +1,54 @@
-[README.md](https://github.com/user-attachments/files/32095181/README.md)
-# 馬柱＆予想支援アプリ v4.1
+[README.md](https://github.com/user-attachments/files/32096475/README.md)
+# 馬柱＆予想支援アプリ v4.2
 
-v4で発生した **Schema validation error** を修正した版です。
+## v4.2 の目的
 
-## v4.1の主な修正
+競馬新聞の細かい文字が全体写真では潰れる問題に対応するため、
+同じレースについて「全体画像＋複数の拡大画像」を用途別に登録できるようにしました。
 
-- `response_schema` から `response_json_schema` に変更
-- nullable項目を `anyOf` で定義
-- `running_style` の `null` 許容方法を修正
-- Google Gen AI SDKを新しいバージョンに固定
-- AIは画像から事実抽出だけ
-- 採点、順位、印、期待値はPython側で固定計算
+## 画像の登録欄
+
+1. 全体画像
+2. 馬柱・近走成績の拡大画像
+3. 調教・追い切り欄の拡大画像
+4. オッズ・血統・騎手情報・その他の拡大画像
+
+すべて複数枚登録できます。
+
+## v4.2 の改善
+
+- 各画像に用途ラベルを付けてGeminiへ送信
+- 同一レースとして複数画像を統合
+- 馬番を最優先に同一馬を照合
+- 全体写真より鮮明な拡大写真を優先
+- スマホ写真のEXIF回転補正
+- 低解像度画像を最大2倍まで拡大
+- 長辺3200pxを上限に調整
+- 軽いコントラスト・シャープ処理
+- 同一画像セットはセッション内キャッシュを利用
+- 「再読取」をOFFにすれば、同じ画像でGeminiを再実行しないため結果が固定されやすい
+- 採点部分は従来どおりPython固定計算
 
 ## GitHubで置き換えるファイル
 
-- `app.py`
-- `requirements.txt`
-- `README.md`
+- app.py
+- requirements.txt
+- README.md（任意）
 
-`scoring_rules.md` はv4のものをそのまま使えます。
+## APIキー
 
-## Streamlit Cloud
-
-Secretsに以下を設定してください。
-
-```toml
-GEMINI_API_KEY = "実際のAPIキー"
-```
-
-APIキーはGitHubへアップロードしないでください。
+Gemini APIキーはGitHubに保存しないでください。
+Streamlit Secrets の `GEMINI_API_KEY` を使用します。
 
 ## テスト方法
 
-1. 同じ馬柱画像をアップロード
-2. 「解析 → 固定ルール採点」
-3. 下部の「Geminiが読み取った生データ」を確認
-4. 同じ画像でもう一度実行
-5. 生データと採点結果の再現性を比較
+まず同じレースについて、
 
-採点部分は同じ入力データなら同じ結果になります。
+- 全体写真 1枚
+- 馬柱拡大 2～4枚
+- 調教拡大 1～3枚
+
+程度で試してください。
+
+2回目の解析では「同じ画像でもGeminiに再読取させる」をOFFにしてください。
+同一画像セットなら前回抽出JSONを再利用するため、採点結果は同じになります。
