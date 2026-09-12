@@ -1106,6 +1106,20 @@ if run:
         else:
             st.success("過去走の取得率は良好です。固定ルール採点へ進みます。")
 
+race = data.get("race") or {}
+        course_name = race.get("course") or "競馬場不明"
+        race_num = f"{race.get('race_number')}R" if race.get("race_number") else "レース番号不明"
+        surface_type = race.get("surface") or ""
+        distance = f"{race.get('distance_m')}m" if race.get("distance_m") else ""
+        class_name = race.get("class_name") or ""
+        
+        race_detail = " / ".join([x for x in [f"{surface_type} {distance}".strip(), class_name] if x])
+        
+        st.markdown(f"## 📍 {course_name} {race_num}")
+        if race_detail:
+            st.caption(f"条件: {race_detail}")
+        st.divider()        
+
         results = score_all(data)
         st.subheader("📊 総合ランキング")
         table = []
