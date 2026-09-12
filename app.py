@@ -220,7 +220,7 @@ def clamp(v, lo, hi):
 
 
 def normalize_text(v):
-    return re.sub(r"[\s　・･\-_]", "", str(v or "")).lower()
+    return re.sub(r"[\s ・･\-_]", "", str(v or "")).lower()
 
 
 def clean_style(v):
@@ -611,9 +611,6 @@ def extract_all_data(client, whole_files, card_files, training_files, other_file
     }
     return data, meta
 
-# =========================================================
-# 固定採点
-# =========================================================
 
 def race_relevance(r, race):
     score = 0
@@ -840,7 +837,6 @@ def score_pedigree(horse):
 
 
 def score_gate(_horse):
-    # コース・距離別統計未導入のため中立。内枠=有利を固定しない。
     return 4.0
 
 
@@ -1083,6 +1079,20 @@ if run:
             st.error("馬データを取得できませんでした。")
             st.stop()
 
+        # レース情報のヘッダー表示
+        race = data.get("race") or {}
+        course_name = race.get("course") or "競馬場不明"
+        race_num = f"{race.get('race_number')}R" if race.get("race_number") else "レース番号不明"
+        surface_type = race.get("surface") or ""
+        distance = f"{race.get('distance_m')}m" if race.get("distance_m") else ""
+        class_name = race.get("class_name") or ""
+        race_detail = " / ".join([x for x in [f"{surface_type} {distance}".strip(), class_name] if x])
+
+        st.markdown(f"## 📍 {course_name} {race_num}")
+        if race_detail:
+            st.caption(f"条件: {race_detail}")
+        st.divider()
+
         quality = extraction_quality(data)
         st.subheader("✅ 抽出品質チェック")
         qcols = st.columns(4)
@@ -1105,20 +1115,6 @@ if run:
             st.warning("⚠ 過去走が不足している馬があります。ランキングは参考値として確認してください。")
         else:
             st.success("過去走の取得率は良好です。固定ルール採点へ進みます。")
-
-race = data.get("race") or {}
-        course_name = race.get("course") or "競馬場不明"
-        race_num = f"{race.get('race_number')}R" if race.get("race_number") else "レース番号不明"
-        surface_type = race.get("surface") or ""
-        distance = f"{race.get('distance_m')}m" if race.get("distance_m") else ""
-        class_name = race.get("class_name") or ""
-        
-        race_detail = " / ".join([x for x in [f"{surface_type} {distance}".strip(), class_name] if x])
-        
-        st.markdown(f"## 📍 {course_name} {race_num}")
-        if race_detail:
-            st.caption(f"条件: {race_detail}")
-        st.divider()        
 
         results = score_all(data)
         st.subheader("📊 総合ランキング")
