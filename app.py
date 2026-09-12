@@ -486,8 +486,9 @@ def estimate_win_probability(results):
 
 
 def add_marks(results):
+    marks = ["◎", "○", "▲", "☆", "△", "◇"]
     for i, r in enumerate(results):
-        r["mark"] = ["◎", "○", "▲", "△"][i] if i < 4 else ""
+        r["mark"] = marks[i] if i < len(marks) else ""
 
 
 def calculate_expected_value(results):
@@ -769,7 +770,7 @@ if run:
         st.dataframe(table, use_container_width=True, hide_index=True)
 
         st.subheader("🎯 予想の見方")
-        st.write("◎○▲△は総合点順位から機械的に決定。AIには印を決めさせていません。")
+        st.write("◎○▲☆△◇は総合点順位から機械的に決定。AIには印を決めさせていません。")
         st.write("参考勝率・期待値は現時点のモデル値で、実際の市場確率や払戻を保証するものではありません。")
 
         st.subheader("🔎 馬ごとの詳細")
