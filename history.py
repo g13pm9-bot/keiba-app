@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 import os
 import csv
+from pathlib import Path
 import streamlit as st
 import pandas as pd
 
-CSV_FILE = "prediction_history.csv"
+CSV_FILE = Path(__file__).resolve().parent / "prediction_history.csv"
 
 def save_prediction(race_info, results):
     """予想結果をCSVファイルに保存する"""
@@ -15,7 +16,13 @@ def save_prediction(race_info, results):
     ]
     
     # ファイルが存在するかどうかをチェック（ヘッダー書き込みの判定用）
-    file_exists = os.path.isfile(CSV_FILE)
+    if not results:
+        raise ValueError("保存する予想結果がありません。")
+    file_exists = os.path.isfile(CSV_FILE) and os.path.getsize(CSV_FILE) > 0
+    if file_exists:
+        with open(CSV_FILE, encoding="utf-8-sig", newline="") as existing:
+            if next(csv.reader(existing), None) != headers:
+                raise ValueError("既存CSVの列が一致しません。履歴ファイルを確認してください。")
     
     # utf-8-sig で保存（Excelで開いたときの文字化け防止）
     with open(CSV_FILE, mode='a', encoding='utf-8-sig', newline='') as f:
@@ -51,12 +58,12 @@ def show_history():
     st.subheader("📖 過去の予想履歴")
     st.write("これまでに保存された予想履歴の一覧です。")
     
-    if not os.path.isfile(CSV_FILE):
+    if not os.path.isfile(CSV_FILE) or os.path.getsize(CSV_FILE) == 0:
         st.info("保存された予想履歴はまだありません。「新規予想」画面から結果を保存してください。")
         return
         
     try:
-        df = pd.read_csv(CSV_FILE)
+        df = pd.read_csv(CSV_FILE, encoding="utf-8-sig", keep_default_na=False)
         # 履歴をデータフレームで表示
         st.dataframe(df, use_container_width=True, hide_index=True)
         
