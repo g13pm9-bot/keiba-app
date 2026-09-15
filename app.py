@@ -20,12 +20,13 @@ from google.genai import types
 
 # v5追加: 履歴管理モジュールのインポート
 import history 
+import recovery
 
 APP_VERSION = "5.0"
 MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 TEMPERATURE = 0.0
 SEED = 7
-EXTRACTION_REVISION = "v5.0-r1"
+EXTRACTION_REVISION = "v5.0-r2"
 
 WEIGHTS = {
     "能力・近走": 20.0,
@@ -401,28 +402,44 @@ def race_row_key(r):
     )
 
 def merge_race_rows(existing, new_rows):
-    merged, by_key = [], {}
+    merged = []
     for src in list(existing or []) + list(new_rows or []):
         if not isinstance(src, dict):
             continue
         meaningful = [src.get("race_date"), src.get("course"), src.get("distance_m"), src.get("finish_position"), src.get("class_name"), src.get("note")]
         if not any(v not in (None, "") for v in meaningful):
             continue
-        key = race_row_key(src)
-        nonempty = sum(v not in (None, "", 0) for v in key)
-        if nonempty < 2:
-            merged.append(deepcopy(src))
-            continue
-        if key not in by_key:
-            row = deepcopy(src)
-            by_key[key] = row
-            merged.append(row)
-        else:
-            row = by_key[key]
+        matches = [row for row in merged if same_previous_race(row, src)]
+        if len(matches) == 1:
+            row = matches[0]
             for k, v in src.items():
                 if row.get(k) in (None, "") and v not in (None, ""):
                     row[k] = v
+        else:
+            merged.append(deepcopy(src))
     return merged
+
+
+def same_previous_race(left, right):
+    # 同じ馬の同じ開催日を軸に照合する。欠損項目は相違と扱わない。
+    dates = [parse_date_loose(row.get("race_date")) for row in (left, right)]
+    raw_dates = [normalize_text(row.get("race_date")) for row in (left, right)]
+    if not all(raw_dates):
+        return False
+    if all(dates):
+        if dates[0].date() != dates[1].date():
+            return False
+    elif raw_dates[0] != raw_dates[1]:
+        return False
+    # 開催場所・距離などが明確に矛盾する行は勝手に統合しない。
+    for key in ("course", "distance_m", "surface", "finish_position", "class_name"):
+        a, b = left.get(key), right.get(key)
+        if a in (None, "") or b in (None, ""):
+            continue
+        convert = integer if key in ("distance_m", "finish_position") else normalize_text
+        if convert(a) != convert(b):
+            return False
+    return True
 
 def sort_previous_races(rows, race):
     current = parse_date_loose(race.get("date"))
@@ -447,13 +464,24 @@ def training_completeness(t):
 def choose_better_training(old, new):
     old = old if isinstance(old, dict) else blank_training()
     new = new if isinstance(new, dict) else blank_training()
-    if training_completeness(new) > training_completeness(old):
+    if not training_completeness(old):
         return deepcopy(new)
-    if training_completeness(new) == training_completeness(old) and training_completeness(new) > 0:
-        keys = ["time_6f", "time_5f", "time_4f", "time_3f", "time_1f", "final_3f", "final_1f"]
-        if sum(num(new.get(k)) is not None for k in keys) > sum(num(old.get(k)) is not None for k in keys):
-            return deepcopy(new)
-    return deepcopy(old)
+    combined = deepcopy(old)
+    old_course, new_course = old.get("course"), new.get("course")
+    # 別のコースや矛盾する時計を混ぜない。既存データは保持する。
+    if not old_course or not new_course:
+        return combined
+    if normalize_training_course(old_course) != normalize_training_course(new_course):
+        return combined
+    keys = ["time_6f", "time_5f", "time_4f", "final_3f", "final_1f"]
+    for key in keys:
+        a, b = training_metric_value(old, key), training_metric_value(new, key)
+        if a is not None and b is not None and a != b:
+            return combined
+    for key, value in new.items():
+        if combined.get(key) in (None, "") and value not in (None, ""):
+            combined[key] = deepcopy(value)
+    return combined
 
 def merge_previous_pass(data, partial):
     for ph in partial.get("horses", []) or []:
@@ -1081,6 +1109,17 @@ if current_sig and st.session_state.get("last_run_sig") == current_sig:
         else:
             st.success("過去走の取得率は良好です。固定ルール採点へ進みます。")
 
+        recovery.show_recovery(
+            data, meta, current_sig, final_cache_key, api_key,
+            data_coverage, num, horse_identity_context, gemini_json,
+            finalize_extracted_data,
+            {
+                "previous": (PREVIOUS_RACES_PROMPT, PREVIOUS_RACES_SCHEMA, merge_previous_pass),
+                "training": (TRAINING_PROMPT, TRAINING_SCHEMA, merge_training_pass),
+                "extra": (EXTRA_PROMPT, EXTRA_SCHEMA, merge_extra_pass),
+            },
+            genai.Client,
+        )
         results = score_all(data)
         st.subheader("📊 総合ランキング")
         table = []
