@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""馬柱＆予想支援アプリ v4.3
+"""馬柱＆予想支援アプリ v5.0
 Geminiは画像から事実抽出のみ。Pythonが固定ルール採点。
-v4.3は用途別OCR、馬番統合、データ根拠率、欠損時の印保留を追加。
+v5.0は予想結果のCSV保存と履歴表示機能を追加。
 """
 
 import hashlib
@@ -18,11 +18,14 @@ from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from google import genai
 from google.genai import types
 
-APP_VERSION = "4.3"
+# v5追加: 履歴管理モジュールのインポート
+import history 
+
+APP_VERSION = "5.0"
 MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 TEMPERATURE = 0.0
 SEED = 7
-EXTRACTION_REVISION = "v4.3-r1"
+EXTRACTION_REVISION = "v5.0-r1"
 
 WEIGHTS = {
     "能力・近走": 20.0,
@@ -200,13 +203,11 @@ EXTRA_PROMPT = r"""
 名前や知名度から能力を推測しない。読めない項目は null。
 """
 
-
 def num(v):
     try:
         return None if v is None or v == "" else float(v)
     except Exception:
         return None
-
 
 def integer(v):
     try:
@@ -214,19 +215,15 @@ def integer(v):
     except Exception:
         return None
 
-
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
-
 
 def normalize_text(v):
     return re.sub(r"[\s ・･\-_]", "", str(v or "")).lower()
 
-
 def clean_style(v):
     s = str(v or "").strip()
     return s if s in KNOWN_STYLES else "不明"
-
 
 def percentile(values, value, higher_is_better=True):
     vals = [x for x in values if x is not None]
@@ -238,20 +235,17 @@ def percentile(values, value, higher_is_better=True):
     equal = sum(x == value for x in vals)
     return 100.0 * (below + 0.5 * equal) / len(vals)
 
-
 def extract_json(text):
     t = (text or "").strip()
     if t.startswith("```"):
         t = t.replace("```json", "").replace("```JSON", "").replace("```", "").strip()
     return json.loads(t)
 
-
 def file_hash(f):
     h = hashlib.sha256()
     h.update(f.name.encode("utf-8", errors="ignore"))
     h.update(f.getvalue())
     return h.hexdigest()
-
 
 def group_signature(groups):
     h = hashlib.sha256(EXTRACTION_REVISION.encode())
@@ -261,14 +255,11 @@ def group_signature(groups):
             h.update(file_hash(f).encode())
     return h.hexdigest()
 
-
 def blank_training():
     return {k: None for k in TRAINING_PROPERTIES.keys()}
 
-
 def blank_pedigree():
     return {"sire": None, "dam_sire": None, "pedigree_note": None}
-
 
 def blank_horse(number=None, name=None):
     return {
@@ -278,7 +269,6 @@ def blank_horse(number=None, name=None):
         "previous_races": [], "pedigree": blank_pedigree(),
         "jockey_course_record_text": None, "jockey_change_text": None, "odds": None,
     }
-
 
 def parse_date_loose(v, reference_year=None):
     if not v:
@@ -299,7 +289,6 @@ def parse_date_loose(v, reference_year=None):
             return None
     return None
 
-
 def prepare_image_bytes(f, target_max=3600):
     img = Image.open(io.BytesIO(f.getvalue()))
     img = ImageOps.exif_transpose(img).convert("RGB")
@@ -319,11 +308,9 @@ def prepare_image_bytes(f, target_max=3600):
     img.save(buf, format="JPEG", quality=95, subsampling=0)
     return buf.getvalue(), "image/jpeg"
 
-
 def image_part(f):
     b, mime = prepare_image_bytes(f)
     return types.Part.from_bytes(data=b, mime_type=mime)
-
 
 def gemini_json(client, task_name, prompt, schema, files, identity_context="", force_reread=False):
     h = hashlib.sha256()
@@ -356,7 +343,6 @@ def gemini_json(client, task_name, prompt, schema, files, identity_context="", f
     st.session_state[cache_key] = deepcopy(data)
     return data
 
-
 def horse_identity_context(horses):
     lines = [
         "以下は基本情報OCRで得た出走馬一覧です。",
@@ -366,7 +352,6 @@ def horse_identity_context(horses):
     for h in sorted(horses, key=lambda x: integer(x.get("horse_number")) or 999):
         lines.append(f'- 馬番 {integer(h.get("horse_number"))}: {h.get("horse_name") or "不明"}')
     return "\n".join(lines)
-
 
 def ensure_horse_shape(h):
     base = blank_horse(h.get("horse_number"), h.get("horse_name"))
@@ -388,7 +373,6 @@ def ensure_horse_shape(h):
         base["previous_races"] = h["previous_races"]
     return base
 
-
 def find_horse(horses, partial):
     n = integer(partial.get("horse_number"))
     if n is not None:
@@ -402,7 +386,6 @@ def find_horse(horses, partial):
                 return h
     return None
 
-
 def merge_scalar_if_empty(target, source, key):
     new = source.get(key)
     if new in (None, ""):
@@ -410,14 +393,12 @@ def merge_scalar_if_empty(target, source, key):
     if target.get(key) in (None, "", "不明"):
         target[key] = new
 
-
 def race_row_key(r):
     return (
         normalize_text(r.get("race_date")), normalize_text(r.get("course")),
         integer(r.get("distance_m")), integer(r.get("finish_position")),
         normalize_text(r.get("class_name")),
     )
-
 
 def merge_race_rows(existing, new_rows):
     merged, by_key = [], {}
@@ -443,7 +424,6 @@ def merge_race_rows(existing, new_rows):
                     row[k] = v
     return merged
 
-
 def sort_previous_races(rows, race):
     current = parse_date_loose(race.get("date"))
     ref_year = current.year if current else datetime.now().year
@@ -459,12 +439,10 @@ def sort_previous_races(rows, race):
     decorated.sort(key=lambda x: (x[0], x[1]), reverse=True)
     return [r for _, __, r in decorated][:8]
 
-
 def training_completeness(t):
     if not isinstance(t, dict):
         return 0
     return sum(t.get(k) not in (None, "") for k in TRAINING_PROPERTIES.keys())
-
 
 def choose_better_training(old, new):
     old = old if isinstance(old, dict) else blank_training()
@@ -477,20 +455,17 @@ def choose_better_training(old, new):
             return deepcopy(new)
     return deepcopy(old)
 
-
 def merge_previous_pass(data, partial):
     for ph in partial.get("horses", []) or []:
         target = find_horse(data["horses"], ph)
         if target is not None:
             target["previous_races"] = merge_race_rows(target.get("previous_races") or [], ph.get("previous_races") or [])
 
-
 def merge_training_pass(data, partial):
     for ph in partial.get("horses", []) or []:
         target = find_horse(data["horses"], ph)
         if target is not None:
             target["training"] = choose_better_training(target.get("training"), ph.get("training"))
-
 
 def merge_extra_pass(data, partial):
     for ph in partial.get("horses", []) or []:
@@ -504,7 +479,6 @@ def merge_extra_pass(data, partial):
         for k in ["sire", "dam_sire", "pedigree_note"]:
             if dst_p.get(k) in (None, "") and src_p.get(k) not in (None, ""):
                 dst_p[k] = src_p.get(k)
-
 
 def infer_days_since_last_race(horse, race):
     if integer(horse.get("days_since_last_race")) is not None:
@@ -523,7 +497,6 @@ def infer_days_since_last_race(horse, race):
     days = (current - prev).days
     if 0 <= days <= 1500:
         horse["days_since_last_race"] = days
-
 
 def finalize_extracted_data(data):
     race = data.get("race") or {}
@@ -558,7 +531,6 @@ def finalize_extracted_data(data):
         race["field_size"] = len(deduped)
     return {"race": race, "horses": deduped}
 
-
 def extract_all_data(client, whole_files, card_files, training_files, other_files, force_reread):
     whole_files, card_files = list(whole_files or []), list(card_files or [])
     training_files, other_files = list(training_files or []), list(other_files or [])
@@ -571,7 +543,7 @@ def extract_all_data(client, whole_files, card_files, training_files, other_file
     extra_sources = other_files or whole_files or card_files
     total_steps = 1 + len(previous_sources) + len(training_sources) + len(extra_sources)
     total_steps = max(total_steps, 1)
-    progress = st.progress(0.0, text="v4.3: 基本情報を読み取っています…")
+    progress = st.progress(0.0, text=f"v{APP_VERSION}: 基本情報を読み取っています…")
     completed = 0
 
     base = gemini_json(client, "base", BASE_PROMPT, BASE_SCHEMA, base_sources, force_reread=force_reread)
@@ -582,24 +554,24 @@ def extract_all_data(client, whole_files, card_files, training_files, other_file
     identity = horse_identity_context(data["horses"])
 
     for i, f in enumerate(previous_sources, 1):
-        progress.progress(completed / total_steps, text=f"v4.3: 過去走専用OCR {i}/{len(previous_sources)}")
+        progress.progress(completed / total_steps, text=f"v{APP_VERSION}: 過去走専用OCR {i}/{len(previous_sources)}")
         partial = gemini_json(client, f"previous_{i}", PREVIOUS_RACES_PROMPT, PREVIOUS_RACES_SCHEMA, [f], identity, force_reread)
         merge_previous_pass(data, partial)
         completed += 1
 
     for i, f in enumerate(training_sources, 1):
-        progress.progress(completed / total_steps, text=f"v4.3: 調教専用OCR {i}/{len(training_sources)}")
+        progress.progress(completed / total_steps, text=f"v{APP_VERSION}: 調教専用OCR {i}/{len(training_sources)}")
         partial = gemini_json(client, f"training_{i}", TRAINING_PROMPT, TRAINING_SCHEMA, [f], identity, force_reread)
         merge_training_pass(data, partial)
         completed += 1
 
     for i, f in enumerate(extra_sources, 1):
-        progress.progress(completed / total_steps, text=f"v4.3: 血統・騎手・オッズ専用OCR {i}/{len(extra_sources)}")
+        progress.progress(completed / total_steps, text=f"v{APP_VERSION}: 血統・騎手・オッズ専用OCR {i}/{len(extra_sources)}")
         partial = gemini_json(client, f"extra_{i}", EXTRA_PROMPT, EXTRA_SCHEMA, [f], identity, force_reread)
         merge_extra_pass(data, partial)
         completed += 1
 
-    progress.progress(1.0, text="v4.3: 抽出結果を整理しています…")
+    progress.progress(1.0, text=f"v{APP_VERSION}: 抽出結果を整理しています…")
     data = finalize_extracted_data(data)
     progress.empty()
     meta = {
@@ -610,7 +582,6 @@ def extract_all_data(client, whole_files, card_files, training_files, other_file
         "total_calls": 1 + len(previous_sources) + len(training_sources) + len(extra_sources),
     }
     return data, meta
-
 
 def race_relevance(r, race):
     score = 0
@@ -625,7 +596,6 @@ def race_relevance(r, race):
     if race.get("track_condition") and r.get("track_condition") and normalize_text(r.get("track_condition")) == normalize_text(race.get("track_condition")):
         score += 1
     return score
-
 
 def result_quality(r):
     pos, n, diff = integer(r.get("finish_position")), integer(r.get("field_size")), num(r.get("time_diff_sec"))
@@ -656,7 +626,6 @@ def result_quality(r):
         s += 0.04
     return clamp(s, 0.0, 1.0)
 
-
 def score_ability(horse, race):
     usable = []
     for r in (horse.get("previous_races") or [])[:8]:
@@ -679,7 +648,6 @@ def score_ability(horse, race):
         elif days >= 180:
             score *= 0.98
     return round(clamp(score, 0, 20), 1)
-
 
 def score_suitability(horse, race):
     races = horse.get("previous_races") or []
@@ -704,7 +672,6 @@ def score_suitability(horse, race):
     score = part(course_q) * 5 + part(dist_q) * 5 + part(surf_q) * 4 + part(cond_q) * 4
     return round(clamp(score, 0, 18), 1)
 
-
 def normalize_training_course(v):
     s = str(v or "").strip()
     if not s:
@@ -724,14 +691,12 @@ def normalize_training_course(v):
         return "W"
     return normalize_text(s) or "不明"
 
-
 def training_metric_value(t, key):
     if key == "final_3f":
         return num(t.get("final_3f")) if num(t.get("final_3f")) is not None else num(t.get("time_3f"))
     if key == "final_1f":
         return num(t.get("final_1f")) if num(t.get("final_1f")) is not None else num(t.get("time_1f"))
     return num(t.get(key))
-
 
 def score_training_clock_all(horses):
     metric_weights = {"time_5f": 0.9, "time_4f": 1.1, "final_3f": 1.0, "final_1f": 1.4}
@@ -763,14 +728,12 @@ def score_training_clock_all(horses):
             out[id(h)] = round(clamp(14.0 * p / 100.0, 0, 14), 1)
     return out
 
-
 def training_comment_adjustment(text):
     s = str(text or "")
     positive = ["好調", "動き良", "動き軽", "伸び鋭", "余力十分", "好仕上", "仕上る", "仕上が", "順調", "力強", "活気", "高いレベル", "安定"]
     negative = ["重い", "反応鈍", "平凡", "物足", "一息", "遅れ", "不安", "まだ", "低調"]
     pos, neg = sum(w in s for w in positive), sum(w in s for w in negative)
     return 0.6 if pos > neg else -0.6 if neg > pos else 0.0
-
 
 def score_condition_3pt(horse):
     score = 1.5
@@ -782,7 +745,6 @@ def score_condition_3pt(horse):
             score -= 0.4
     score += training_comment_adjustment((horse.get("training") or {}).get("training_comment"))
     return round(clamp(score, 0, 3), 1)
-
 
 def score_pace(horse, horses):
     styles = [clean_style(h.get("running_style")) for h in horses]
@@ -801,16 +763,13 @@ def score_pace(horse, horses):
         return 10.0 if escape >= 2 or fast_front >= 6 else 7.0
     return 7.5
 
-
 def extract_rate(text, label):
     m = re.search(rf"{label}\s*[:：]?\s*(\d+(?:\.\d+)?)\s*%", text)
     return float(m.group(1)) if m else None
 
-
 def jockey_evidence(horse):
     text = " ".join([horse.get("jockey_course_record_text") or "", horse.get("jockey_change_text") or ""])
     return bool(re.search(r"\d+(?:\.\d+)?\s*%", text))
-
 
 def score_jockey(horse):
     text = " ".join([horse.get("jockey_course_record_text") or "", horse.get("jockey_change_text") or ""])
@@ -825,7 +784,6 @@ def score_jockey(horse):
         return 9.5 if quinella >= 35 else 8.0 if quinella >= 25 else 6.5 if quinella >= 15 else 5.0
     return 6.0
 
-
 def score_pedigree(horse):
     note = str((horse.get("pedigree") or {}).get("pedigree_note") or "")
     score = 5.0
@@ -835,20 +793,16 @@ def score_pedigree(horse):
         score -= 1.0
     return round(clamp(score, 0, 10), 1)
 
-
 def score_gate(_horse):
     return 4.0
-
 
 def training_numeric_count(horse):
     t = horse.get("training") or {}
     vals = [num(t.get("time_5f")), num(t.get("time_4f")), training_metric_value(t, "final_3f"), training_metric_value(t, "final_1f")]
     return sum(v is not None for v in vals)
 
-
 def previous_usable_count(horse):
     return sum(result_quality(r) is not None for r in (horse.get("previous_races") or []))
-
 
 def data_coverage(horse):
     prev_n, train_n = previous_usable_count(horse), training_numeric_count(horse)
@@ -893,10 +847,8 @@ def data_coverage(horse):
     reliability = "高" if pct >= 80 and prev_n >= 3 else "中" if pct >= 55 and prev_n >= 1 else "低"
     return pct, reliability, missing
 
-
 def rank_label(x):
     return "S" if x >= 85 else "A+" if x >= 80 else "A" if x >= 75 else "B+" if x >= 70 else "B" if x >= 65 else "C+" if x >= 60 else "C" if x >= 55 else "D"
-
 
 def add_marks(results):
     marks = ["◎", "○", "▲", "☆", "△", "◇"]
@@ -905,7 +857,6 @@ def add_marks(results):
         r["mark"] = ""
     for mark, r in zip(marks, eligible):
         r["mark"] = mark
-
 
 def estimate_win_probability(results):
     if not results:
@@ -922,12 +873,10 @@ def estimate_win_probability(results):
         r["model_win_prob"] = round(100.0 * e / s, 1)
     return True
 
-
 def calculate_expected_value(results):
     for r in results:
         odds, p = num(r.get("odds")), num(r.get("model_win_prob"))
         r["expected_value"] = round((p / 100.0) * odds, 2) if odds is not None and odds > 0 and p is not None else None
-
 
 def score_all(data):
     race, horses = data.get("race") or {}, data.get("horses") or []
@@ -956,7 +905,6 @@ def score_all(data):
     calculate_expected_value(results)
     return results
 
-
 def extraction_quality(data):
     horses = data.get("horses") or []
     return {
@@ -974,14 +922,24 @@ def extraction_quality(data):
 # =========================================================
 st.set_page_config(page_title=f"馬柱＆予想支援 v{APP_VERSION}", layout="wide")
 st.title(f"🏇 馬柱 ＆ 予想支援アプリ v{APP_VERSION}")
-st.caption("v4.3: 過去走・調教・その他を用途別に複数回OCRし、馬番で統合してから固定ルール採点します。")
+
+# v5追加: 画面切り替えメニュー
+st.sidebar.subheader("メニュー")
+app_mode = st.sidebar.radio("画面選択", ["🎯 新規予想", "📖 予想履歴"])
+st.sidebar.divider()
+
+if app_mode == "📖 予想履歴":
+    history.show_history()
+    st.stop()  # 履歴画面のときは、以降の新規予想UIを表示させない
+
+st.caption(f"v{APP_VERSION}: 過去走・調教・その他を用途別に複数回OCRし、馬番で統合してから固定ルール採点します。さらに予想結果の保存に対応しました。")
 
 try:
     api_key = st.secrets["GEMINI_API_KEY"]
 except Exception:
     api_key = st.sidebar.text_input("Gemini APIキー", type="password")
 
-st.sidebar.subheader("v4.3 撮影のコツ")
+st.sidebar.subheader(f"v{APP_VERSION} 撮影のコツ")
 st.sidebar.write("・全体画像: 馬番・馬名・枠番が分かる写真")
 st.sidebar.write("・近走欄: 前走～数走前が読める大きさで拡大")
 st.sidebar.write("・調教欄: 時計と馬名/馬番が同時に見える拡大")
@@ -995,31 +953,31 @@ st.sidebar.divider()
 st.sidebar.caption(f"Gemini model: {MODEL_NAME}")
 
 st.subheader("📷 画像登録")
-st.info("v4.3では『② 馬柱・近走成績の拡大画像』が特に重要です。過去走が取れない馬には原則として印を付けません。")
+st.info("『② 馬柱・近走成績の拡大画像』が特に重要です。過去走が取れない馬には原則として印を付けません。")
 
 whole_files = st.file_uploader(
     "① 全体画像（レース全体・馬番確認用）",
     type=["jpg", "jpeg", "png", "webp"],
     accept_multiple_files=True,
-    key="whole_files_v43",
+    key="whole_files",
 )
 card_files = st.file_uploader(
     "② 馬柱・近走成績の拡大画像（最重要・複数可）",
     type=["jpg", "jpeg", "png", "webp"],
     accept_multiple_files=True,
-    key="card_files_v43",
+    key="card_files",
 )
 training_files = st.file_uploader(
     "③ 調教・追い切り欄の拡大画像（複数可）",
     type=["jpg", "jpeg", "png", "webp"],
     accept_multiple_files=True,
-    key="training_files_v43",
+    key="training_files",
 )
 other_files = st.file_uploader(
     "④ オッズ・血統・騎手情報・その他の拡大画像（複数可）",
     type=["jpg", "jpeg", "png", "webp"],
     accept_multiple_files=True,
-    key="other_files_v43",
+    key="other_files",
 )
 
 grouped_files = [
@@ -1047,22 +1005,29 @@ force_reread = st.checkbox(
     help="通常はOFF推奨。ONにすると用途別OCRをすべて再実行します。",
 )
 
+# v5変更: 保存ボタン押下時にも結果表示をキープするための処理
 run = st.button(
-    "🔍 v4.3 高精度解析 → 固定ルール採点",
+    f"🔍 v{APP_VERSION} 高精度解析 → 固定ルール採点",
     type="primary",
     disabled=not (api_key and all_files),
 )
 
+current_sig = group_signature(grouped_files) if all_files else None
+
 if run:
+    st.session_state.last_run_sig = current_sig
+
+# runが押された後、ファイルが変更されない限り結果を表示し続ける
+if current_sig and st.session_state.get("last_run_sig") == current_sig:
     try:
         client = genai.Client(api_key=api_key)
-        sig = group_signature(grouped_files)
-        final_cache_key = f"v43_final_{sig}"
+        final_cache_key = f"v50_final_{current_sig}"
 
         if not force_reread and final_cache_key in st.session_state:
             stored = deepcopy(st.session_state[final_cache_key])
             data, meta = stored["data"], stored["meta"]
-            st.info("同じ画像セットのv4.3統合データを再利用しました。Geminiの再読取はしていません。")
+            if run: # 新規実行のときだけメッセージを出す
+                st.info("同じ画像セットの統合データを再利用しました。Geminiの再読取はしていません。")
         else:
             data, meta = extract_all_data(
                 client,
@@ -1130,6 +1095,17 @@ if run:
             })
         st.dataframe(table, use_container_width=True, hide_index=True)
 
+        # ▼▼ v5追加: 保存ボタンの設置 ▼▼
+        st.divider()
+        if st.button("💾 この予想結果を履歴に保存する", type="primary"):
+            try:
+                history.save_prediction(race, results)
+                st.success("🎉 CSVファイルに予想結果を保存しました！サイドバーの「メニュー」から履歴を確認できます。")
+            except Exception as e:
+                st.error(f"保存中にエラーが発生しました: {e}")
+        st.divider()
+        # ▲▲ v5追加: 保存ボタンの設置 ▲▲
+
         st.subheader("🎯 予想の見方")
         st.write("◎○▲☆△◇は総合点から機械的に決定します。ただし、過去走0件または根拠率55%未満の馬には印を付けません。")
         st.write("血統は父名が読めただけでは加点せず、枠順もコース別統計が無い現段階では中立点です。")
@@ -1150,19 +1126,6 @@ if run:
         st.subheader("🧾 抽出された生データ")
         st.info("採点結果より先に生データを確認してください。特に previous_races が入っているかが最重要です。")
         st.json(data)
-
-        st.download_button(
-            "生データJSONを保存",
-            json.dumps(data, ensure_ascii=False, indent=2),
-            "race_extracted_data_v4_3.json",
-            "application/json",
-        )
-        st.download_button(
-            "採点結果JSONを保存",
-            json.dumps(results, ensure_ascii=False, indent=2),
-            "race_scored_results_v4_3.json",
-            "application/json",
-        )
 
     except Exception as e:
         st.error(f"エラーが発生しました: {e}")
