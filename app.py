@@ -1020,15 +1020,15 @@ if run:
 # runが押された後、ファイルが変更されない限り結果を表示し続ける
 if current_sig and st.session_state.get("last_run_sig") == current_sig:
     try:
-        client = genai.Client(api_key=api_key)
         final_cache_key = f"v50_final_{current_sig}"
 
-        if not force_reread and final_cache_key in st.session_state:
+        if final_cache_key in st.session_state and not (run and force_reread):
             stored = deepcopy(st.session_state[final_cache_key])
             data, meta = stored["data"], stored["meta"]
             if run: # 新規実行のときだけメッセージを出す
                 st.info("同じ画像セットの統合データを再利用しました。Geminiの再読取はしていません。")
         else:
+            client = genai.Client(api_key=api_key)
             data, meta = extract_all_data(
                 client,
                 whole_files or [],
