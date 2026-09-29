@@ -1,19 +1,20 @@
 # -*- coding: utf-8 -*-
 """馬柱＆予想支援アプリ v5.0
-Geminiは画像から事実抽出のみ。Pythonが固定ルール採点。
+OCRは画像から事実抽出のみ。Pythonが固定ルール採点。
 v5.0は予想結果のCSV保存と履歴表示機能を追加。
 """
 
 import hashlib
 import io
 import json
+import os
 import re
 from copy import deepcopy
 from datetime import datetime
 
 import streamlit as st
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
-from ocr_gemini import MODEL_NAME, create_client, request_json
+import ocr_gemini
 
 # v5追加: 履歴管理モジュールのインポート
 import history 
@@ -241,6 +242,7 @@ def file_hash(f):
 
 def group_signature(groups):
     h = hashlib.sha256(EXTRACTION_REVISION.encode())
+    h.update(json.dumps([provider, MODEL_NAME], ensure_ascii=False).encode())
     for name, files in groups:
         h.update(name.encode())
         for f in files:
@@ -301,8 +303,9 @@ def prepare_image_bytes(f, target_max=3600):
     return buf.getvalue(), "image/jpeg"
 
 
-def gemini_json(client, task_name, prompt, schema, files, identity_context="", force_reread=False):
+def ocr_json(client, task_name, prompt, schema, files, identity_context="", force_reread=False):
     h = hashlib.sha256()
+    h.update(json.dumps([provider, MODEL_NAME], ensure_ascii=False).encode())
     for s in (EXTRACTION_REVISION, MODEL_NAME, task_name, prompt, identity_context):
         h.update(s.encode())
     for f in files:
@@ -550,7 +553,7 @@ def extract_all_data(client, whole_files, card_files, training_files, other_file
     progress = st.progress(0.0, text=f"v{APP_VERSION}: 基本情報を読み取っています…")
     completed = 0
 
-    base = gemini_json(client, "base", BASE_PROMPT, BASE_SCHEMA, base_sources, force_reread=force_reread)
+    base = ocr_json(client, "base", BASE_PROMPT, BASE_SCHEMA, base_sources, force_reread=force_reread)
     data = {"race": base.get("race") or {}, "horses": [ensure_horse_shape(h) for h in (base.get("horses") or [])]}
     if not data["horses"]:
         raise ValueError("出走馬の基本情報を取得できませんでした。全体画像を確認してください。")
@@ -559,19 +562,19 @@ def extract_all_data(client, whole_files, card_files, training_files, other_file
 
     for i, f in enumerate(previous_sources, 1):
         progress.progress(completed / total_steps, text=f"v{APP_VERSION}: 過去走専用OCR {i}/{len(previous_sources)}")
-        partial = gemini_json(client, f"previous_{i}", PREVIOUS_RACES_PROMPT, PREVIOUS_RACES_SCHEMA, [f], identity, force_reread)
+        partial = ocr_json(client, f"previous_{i}", PREVIOUS_RACES_PROMPT, PREVIOUS_RACES_SCHEMA, [f], identity, force_reread)
         merge_previous_pass(data, partial)
         completed += 1
 
     for i, f in enumerate(training_sources, 1):
         progress.progress(completed / total_steps, text=f"v{APP_VERSION}: 調教専用OCR {i}/{len(training_sources)}")
-        partial = gemini_json(client, f"training_{i}", TRAINING_PROMPT, TRAINING_SCHEMA, [f], identity, force_reread)
+        partial = ocr_json(client, f"training_{i}", TRAINING_PROMPT, TRAINING_SCHEMA, [f], identity, force_reread)
         merge_training_pass(data, partial)
         completed += 1
 
     for i, f in enumerate(extra_sources, 1):
         progress.progress(completed / total_steps, text=f"v{APP_VERSION}: 血統・騎手・オッズ専用OCR {i}/{len(extra_sources)}")
-        partial = gemini_json(client, f"extra_{i}", EXTRA_PROMPT, EXTRA_SCHEMA, [f], identity, force_reread)
+        partial = ocr_json(client, f"extra_{i}", EXTRA_PROMPT, EXTRA_SCHEMA, [f], identity, force_reread)
         merge_extra_pass(data, partial)
         completed += 1
 
@@ -639,10 +642,32 @@ if app_mode == "📖 予想履歴":
 
 st.caption(f"v{APP_VERSION}: 過去走・調教・その他を用途別に複数回OCRし、馬番で統合してから固定ルール採点します。さらに予想結果の保存に対応しました。")
 
-try:
-    api_key = st.secrets["GEMINI_API_KEY"]
-except Exception:
-    api_key = st.sidebar.text_input("Gemini APIキー", type="password")
+provider = st.sidebar.selectbox("OCR provider", ["gemini", "openai"], index=0,
+                                key="ocr_provider")
+if provider == "gemini":
+    ocr_backend = ocr_gemini
+    provider_label = "Gemini"
+    try:
+        api_key = st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        api_key = st.sidebar.text_input("Gemini APIキー", type="password")
+else:
+    import ocr_openai
+
+    ocr_backend = ocr_openai
+    provider_label = "OpenAI"
+    try:
+        configured_key = st.secrets["OPENAI_API_KEY"]
+    except Exception:
+        configured_key = os.getenv("OPENAI_API_KEY", "")
+    entered_key = st.sidebar.text_input("OpenAI APIキー", type="password",
+                                        key="openai_api_key_input",
+                                        help="未入力の場合はsecretsまたは環境変数OPENAI_API_KEYを使用します。")
+    api_key = entered_key.strip() or configured_key
+
+MODEL_NAME = ocr_backend.MODEL_NAME
+create_client = ocr_backend.create_client
+request_json = ocr_backend.request_json
 
 st.sidebar.subheader(f"v{APP_VERSION} 撮影のコツ")
 st.sidebar.write("・全体画像: 馬番・馬名・枠番が分かる写真")
@@ -655,7 +680,7 @@ st.sidebar.subheader("100点配分")
 for k, v in WEIGHTS.items():
     st.sidebar.write(f"{k}: {v:g}点")
 st.sidebar.divider()
-st.sidebar.caption(f"Gemini model: {MODEL_NAME}")
+st.sidebar.caption(f"{provider_label} model: {MODEL_NAME}")
 
 st.subheader("📷 画像登録")
 st.info("『② 馬柱・近走成績の拡大画像』が特に重要です。過去走が取れない馬には原則として印を付けません。")
@@ -705,7 +730,7 @@ if all_files:
                 n += 1
 
 force_reread = st.checkbox(
-    "同じ画像でもGeminiに再読取させる",
+    f"同じ画像でも{provider_label}に再読取させる",
     value=False,
     help="通常はOFF推奨。ONにすると用途別OCRをすべて再実行します。",
 )
@@ -731,7 +756,7 @@ if current_sig and st.session_state.get("last_run_sig") == current_sig:
             stored = deepcopy(st.session_state[final_cache_key])
             data, meta = stored["data"], stored["meta"]
             if run: # 新規実行のときだけメッセージを出す
-                st.info("同じ画像セットの統合データを再利用しました。Geminiの再読取はしていません。")
+                st.info(f"同じ画像セットの統合データを再利用しました。{provider_label}の再読取はしていません。")
         else:
             client = create_client(api_key=api_key)
             data, meta = extract_all_data(
@@ -771,7 +796,7 @@ if current_sig and st.session_state.get("last_run_sig") == current_sig:
         qcols[2].metric("調教取得", f'{quality["training_horses"]}/{quality["horses"]}頭')
         qcols[3].metric("過去走行数", f'{quality["previous_rows"]}行')
         st.caption(
-            f'Gemini呼び出し: 基本 {meta["base_calls"]}回 / 過去走 {meta["previous_calls"]}回 / '
+            f'{provider_label}呼び出し: 基本 {meta["base_calls"]}回 / 過去走 {meta["previous_calls"]}回 / '
             f'調教 {meta["training_calls"]}回 / その他 {meta["extra_calls"]}回'
         )
 
@@ -788,7 +813,7 @@ if current_sig and st.session_state.get("last_run_sig") == current_sig:
 
         recovery.show_recovery(
             data, meta, current_sig, final_cache_key, api_key,
-            data_coverage, num, horse_identity_context, gemini_json,
+            data_coverage, num, horse_identity_context, ocr_json,
             finalize_extracted_data,
             {
                 "previous": (PREVIOUS_RACES_PROMPT, PREVIOUS_RACES_SCHEMA, merge_previous_pass),
