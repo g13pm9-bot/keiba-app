@@ -625,6 +625,173 @@ def extraction_quality(data):
         "odds_horses": sum(num(h.get("odds")) is not None for h in horses),
     }
 
+def jvlink_race_target(data):
+    """OCRに明確な年月日・中央競馬場・R番号がある場合だけ取得対象を返す。"""
+    race = data.get("race") or {}
+    date_text = race.get("race_date") or race.get("date")
+    if not isinstance(date_text, str):
+        return None
+    date = None
+    for fmt in ("%Y%m%d", "%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            if len(date_text.strip()) in (8, 10):
+                date = datetime.strptime(date_text.strip(), fmt).strftime("%Y%m%d")
+                break
+        except ValueError:
+            pass
+    courses = {"01": "札幌", "02": "函館", "03": "福島", "04": "新潟", "05": "東京",
+               "06": "中山", "07": "中京", "08": "京都", "09": "阪神", "10": "小倉"}
+    course_value = race.get("course")
+    if type(course_value) not in (str, int):
+        return None
+    course_text = str(course_value).strip()
+    course = courses.get(course_text.zfill(2), course_text)
+    number = race.get("race_number")
+    if type(number) is int:
+        race_number = number
+    elif isinstance(number, str) and number.strip().isascii() and number.strip().isdecimal():
+        race_number = int(number.strip())
+    else:
+        return None
+    if date is None or course not in courses.values() or not 1 <= race_number <= 12:
+        return None
+    return date, course, race_number
+
+
+def show_jvlink_comparison(data, signature):
+    """照合結果を保存・表示する。OCR原本は変更しない。"""
+    st.subheader("🏇 JRA-VAN出馬表との照合")
+    st.caption("安全条件をすべて満たす照合結果だけ採点に反映します。OCR原本は保持します。")
+    cache_key = f"jvlink_comparison_{signature}"
+    fingerprint = hashlib.sha256(json.dumps(
+        data, ensure_ascii=False, sort_keys=True, default=str,
+    ).encode("utf-8")).hexdigest()
+    cached = st.session_state.get(cache_key)
+    if cached is not None and cached.get("ocr_fingerprint") != fingerprint:
+        # 再OCRや追加写真でOCR内容が変わったら、古い照合結果を表示しない。
+        st.session_state.pop(cache_key, None)
+        cached = None
+    target = jvlink_race_target(data)
+    if target is None:
+        st.info("照合には、OCR結果の年を含むレース日・競馬場・レース番号が必要です。")
+        return
+    label = "JRA-VAN再取得" if cached is not None else "JRA-VANで照合"
+    if st.button(label, key=f"jvlink_comparison_button_{signature}"):
+        cached = {"ocr_fingerprint": fingerprint, "target": target,
+                  "external_data": None, "reconciliation": None, "error": None}
+        st.session_state[cache_key] = cached
+        try:
+            # ボタン押下時だけimport・COM取得。通常の画面再描画では通信しない。
+            from racecard_jvlink import fetch_racecard
+            from reconciliation import reconcile_racecard
+
+            with st.spinner("JRA-VAN出馬表を取得して照合しています…"):
+                external_data = fetch_racecard(*target)
+                cached["external_data"] = deepcopy(external_data)
+                cached["reconciliation"] = reconcile_racecard(
+                    deepcopy(data), deepcopy(external_data), auto_correct_by_horse_number=True,
+                )
+        except Exception as exc:
+            cached["error"] = f"{type(exc).__name__}: {exc}"
+        st.session_state[cache_key] = cached
+    if cached is None:
+        return
+    if cached["error"]:
+        st.error(f"JRA-VAN照合に失敗しました: {cached['error']}")
+        return
+    result = cached["reconciliation"]
+    if result is None:
+        return
+    auto = result["auto_correction"]
+    st.write({"auto_correction.requested": auto["requested"],
+              "auto_correction.enabled": auto["enabled"],
+              "auto_correction.reason": auto["reason"],
+              "ready_for_scoring": result["ready_for_scoring"]})
+    if auto["enabled"]:
+        st.success("馬番が全頭確認できたため、JRA-VAN値で補正可能です")
+    else:
+        st.warning("自動補正は無効です。確認が必要です")
+    comparison_rows = []
+    for row in result["reconciliations"]:
+        fields = row["fields"]
+        number = fields["horse_number"]
+        display_number = next((number[key] for key in ("final_value", "ocr_value", "external_value")
+                               if number[key] is not None), None)
+        comparison_rows.append({
+            "horse_number": display_number,
+            "OCR馬名": fields["horse_name"]["ocr_value"],
+            "JRA-VAN馬名": fields["horse_name"]["external_value"],
+            "確定馬名": fields["horse_name"]["final_value"],
+            "OCR騎手名": fields["jockey_name"]["ocr_value"],
+            "JRA-VAN騎手名": fields["jockey_name"]["external_value"],
+            "確定騎手名": fields["jockey_name"]["final_value"],
+            "OCR枠番": fields["frame_number"]["ocr_value"],
+            "JRA-VAN枠番": fields["frame_number"]["external_value"],
+            "確定枠番": fields["frame_number"]["final_value"],
+            "status": row["status"],
+        })
+    st.dataframe(comparison_rows, use_container_width=True, hide_index=True)
+    with st.expander("照合理由・確認待ち項目", expanded=False):
+        st.json({"安全条件の不成立理由": auto.get("failures", []),
+                 "確認待ち": result["pending_review"],
+                 "行ごとの理由": [{"行ID": row["row_id"], "理由": row["reasons"]}
+                                  for row in result["reconciliations"] if row["reasons"]]})
+
+
+def jvlink_scoring_data(data, signature):
+    """キャッシュを検証し、4識別項目だけを差し替えた採点用コピーを作る。
+
+    戻り値: (採点データ, 補正使用フラグ, 照合キャッシュ有無)。
+    通信・再照合は行わず、欠損・不整合・例外では必ずOCR原本へ戻る。
+    """
+    cached = st.session_state.get(f"jvlink_comparison_{signature}")
+    if cached is None:
+        return data, False, False
+    try:
+        fingerprint = hashlib.sha256(json.dumps(
+            data, ensure_ascii=False, sort_keys=True, default=str,
+        ).encode("utf-8")).hexdigest()
+        if cached.get("ocr_fingerprint") != fingerprint or cached.get("error"):
+            return data, False, True
+        if cached.get("target") != jvlink_race_target(data):
+            return data, False, True
+        result = cached.get("reconciliation")
+        if not isinstance(result, dict):
+            return data, False, True
+        if (result.get("auto_correction", {}).get("enabled") is not True
+                or result.get("ready_for_scoring") is not True
+                or result.get("pending_review") != []):
+            return data, False, True
+        ocr_horses = data.get("horses")
+        final_horses = result.get("horses")
+        if (not isinstance(ocr_horses, list) or not ocr_horses
+                or not isinstance(final_horses, list) or len(final_horses) != len(ocr_horses)):
+            return data, False, True
+        ocr_numbers = [horse.get("horse_number") for horse in ocr_horses]
+        final_numbers = [horse.get("horse_number") for horse in final_horses]
+        if any(type(number) is not int or not 1 <= number <= 28
+               for number in ocr_numbers + final_numbers):
+            return data, False, True
+        if (len(set(ocr_numbers)) != len(ocr_numbers)
+                or len(set(final_numbers)) != len(final_numbers)
+                or set(ocr_numbers) != set(final_numbers)):
+            return data, False, True
+        for horse in final_horses:
+            if (not isinstance(horse.get("horse_name"), str) or not horse["horse_name"].strip()
+                    or not isinstance(horse.get("jockey_name"), str) or not horse["jockey_name"].strip()
+                    or type(horse.get("frame_number")) is not int or not 1 <= horse["frame_number"] <= 8):
+                return data, False, True
+        final_by_number = {horse["horse_number"]: horse for horse in final_horses}
+        scoring_data = deepcopy(data)
+        for horse in scoring_data["horses"]:
+            confirmed = final_by_number[horse["horse_number"]]
+            for field in ("horse_number", "horse_name", "frame_number", "jockey_name"):
+                horse[field] = deepcopy(confirmed[field])
+        return scoring_data, True, True
+    except Exception:
+        return data, False, True
+
+
 # =========================================================
 # UI
 # =========================================================
@@ -822,7 +989,23 @@ if current_sig and st.session_state.get("last_run_sig") == current_sig:
             },
             create_client,
         )
-        results = score_all(data)
+        comparison_failed = False
+        try:
+            show_jvlink_comparison(data, current_sig)
+        except Exception as exc:
+            # 照合表示の失敗も採点・保存の既存処理を止めない。
+            st.error(f"JRA-VAN照合表示に失敗しました: {type(exc).__name__}: {exc}")
+            comparison_failed = True
+        scoring_data, jvlink_used, comparison_exists = jvlink_scoring_data(data, current_sig)
+        if comparison_failed:
+            scoring_data, jvlink_used = data, False
+        if jvlink_used:
+            st.success("✅ JRA-VAN補正済みデータで採点しています")
+        elif comparison_exists or comparison_failed:
+            st.warning("⚠️ JRA-VAN照合結果に未確認項目があるため、OCRデータで採点しています")
+        else:
+            st.info("ℹ️ OCRデータで採点しています")
+        results = score_all(scoring_data)
         st.subheader("📊 総合ランキング")
         table = []
         for r in results:
@@ -840,7 +1023,7 @@ if current_sig and st.session_state.get("last_run_sig") == current_sig:
         st.divider()
         if st.button("💾 この予想結果を履歴に保存する", type="primary"):
             try:
-                history.save_prediction(race, results)
+                history.save_prediction(scoring_data.get("race") or {}, results)
                 st.success("🎉 CSVファイルに予想結果を保存しました！サイドバーの「メニュー」から履歴を確認できます。")
             except Exception as e:
                 st.error(f"保存中にエラーが発生しました: {e}")
@@ -867,6 +1050,9 @@ if current_sig and st.session_state.get("last_run_sig") == current_sig:
         st.subheader("🧾 抽出された生データ")
         st.info("採点結果より先に生データを確認してください。特に previous_races が入っているかが最重要です。")
         st.json(data)
+        if jvlink_used:
+            with st.expander("採点に使用した補正済みデータ", expanded=False):
+                st.json(scoring_data)
 
     except Exception as e:
         st.error(f"エラーが発生しました: {e}")
